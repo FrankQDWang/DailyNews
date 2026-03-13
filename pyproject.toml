@@ -1,0 +1,66 @@
+[project]
+name = "dailynews"
+version = "0.1.0"
+description = "Telegram conversational research assistant powered by RSS + Temporal + DeepSeek"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.16.5",
+  "asyncpg>=0.30.0",
+  "fastapi>=0.117.0",
+  "httpx>=0.28.1",
+  "pgvector>=0.4.1",
+  "prometheus-client>=0.23.1",
+  "pydantic>=2.11.9",
+  "pydantic-settings>=2.11.0",
+  "python-dotenv>=1.1.1",
+  "sqlalchemy>=2.0.43",
+  "temporalio>=1.17.0",
+  "uvicorn>=0.36.0",
+]
+
+[dependency-groups]
+dev = [
+  "mypy>=1.18.1",
+  "pytest>=8.4.2",
+  "pytest-asyncio>=1.2.0",
+  "ruff>=0.13.2",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "A", "ASYNC"]
+ignore = ["B008", "E501", "UP042"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["temporalio.*", "pgvector.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+  "apps.api.main",
+  "libs.core.db.repositories",
+  "libs.integrations.miniflux_client",
+  "libs.workflows.*",
+]
+ignore_errors = true
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.uv]
+default-groups = ["dev"]
