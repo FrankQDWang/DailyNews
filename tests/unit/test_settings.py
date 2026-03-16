@@ -20,3 +20,13 @@ def test_settings_admin_id_parse() -> None:
     settings = Settings.model_validate(_base_env())
     assert settings.telegram_admin_user_ids == [1, 2, 3]
     assert settings.telegram_target_chat_id == -10001
+    assert settings.assistant_db_async_url == 'postgresql+asyncpg://u:p@localhost:5432/db'
+    assert settings.assistant_db_sync_url == 'postgresql://u:p@localhost:5432/db'
+
+
+def test_settings_postgres_scheme_normalization() -> None:
+    env = _base_env()
+    env['ASSISTANT_DB_URL'] = 'postgresql://u:p@db.internal:5432/railway?sslmode=disable'
+    settings = Settings.model_validate(env)
+    assert settings.assistant_db_async_url == 'postgresql+asyncpg://u:p@db.internal:5432/railway?sslmode=disable'
+    assert settings.assistant_db_sync_url == 'postgresql://u:p@db.internal:5432/railway?sslmode=disable'

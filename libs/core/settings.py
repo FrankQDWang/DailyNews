@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -57,6 +58,28 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [int(chunk.strip()) for chunk in value.split(",") if chunk.strip()]
         raise ValueError("TELEGRAM_ADMIN_USER_IDS must be comma-separated ids")
+
+    @property
+    def assistant_db_async_url(self) -> str:
+        return _normalize_postgres_scheme(self.assistant_db_url, async_driver=True)
+
+    @property
+    def assistant_db_sync_url(self) -> str:
+        return _normalize_postgres_scheme(self.assistant_db_url, async_driver=False)
+
+
+def _normalize_postgres_scheme(url: str, *, async_driver: bool) -> str:
+    parsed = urlsplit(url)
+    scheme = parsed.scheme
+
+    if scheme in {"postgres", "postgresql"}:
+        normalized_scheme = "postgresql+asyncpg" if async_driver else "postgresql"
+    elif scheme == "postgresql+asyncpg":
+        normalized_scheme = scheme if async_driver else "postgresql"
+    else:
+        return url
+
+    return urlunsplit((normalized_scheme, parsed.netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 @lru_cache(maxsize=1)
