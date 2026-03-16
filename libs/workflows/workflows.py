@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -58,7 +59,7 @@ class IngestBatchWorkflow:
 @workflow.defn
 class ProcessEntryWorkflow:
     @workflow.run
-    async def run(self, entry_id: int) -> dict[str, object]:
+    async def run(self, entry_id: int) -> dict[str, Any]:
         summary = await workflow.execute_activity(
             summarize_entry_activity,
             entry_id,
@@ -105,7 +106,7 @@ class ProcessEntryWorkflow:
 @workflow.defn
 class VerifyEntryWorkflow:
     @workflow.run
-    async def run(self, entry_id: int) -> dict[str, object]:
+    async def run(self, entry_id: int) -> dict[str, Any]:
         result = await workflow.execute_activity(
             verify_entry_activity,
             entry_id,
@@ -132,7 +133,7 @@ class PushAlertWorkflow:
 @workflow.defn
 class DailyDigestWorkflow:
     @workflow.run
-    async def run(self) -> dict[str, object]:
+    async def run(self) -> dict[str, Any]:
         digest = await workflow.execute_activity(
             build_digest_activity,
             start_to_close_timeout=timedelta(minutes=8),

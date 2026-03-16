@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import select
 from temporalio import activity
@@ -26,7 +27,11 @@ from libs.core.db.session import SessionFactory
 from libs.core.metrics import MINIFLUX_FETCH_CONTENT_FAILURES, NEW_ENTRIES_FOUND, TASKS_TOTAL
 from libs.core.settings import get_settings
 from libs.integrations.deepseek_client import DeepSeekClient
-from libs.integrations.miniflux_client import MinifluxClient, serialize_entries
+from libs.integrations.miniflux_client import (
+    MinifluxClient,
+    MinifluxEntryPayload,
+    serialize_entries,
+)
 from libs.integrations.tavily_client import TavilyClient
 from libs.integrations.telegram_client import TelegramClient
 
@@ -50,7 +55,7 @@ async def refresh_miniflux_activity() -> None:
 
 
 @activity.defn
-async def list_unread_miniflux_activity(limit: int = 100) -> list[dict[str, object]]:
+async def list_unread_miniflux_activity(limit: int = 100) -> list[MinifluxEntryPayload]:
     TASKS_TOTAL.labels(type="list_unread_miniflux").inc()
     client = MinifluxClient(settings)
     try:
@@ -64,7 +69,7 @@ async def list_unread_miniflux_activity(limit: int = 100) -> list[dict[str, obje
 
 
 @activity.defn
-async def fetch_and_upsert_entry_activity(entry_payload: dict[str, object]) -> int:
+async def fetch_and_upsert_entry_activity(entry_payload: MinifluxEntryPayload) -> int:
     TASKS_TOTAL.labels(type="fetch_and_upsert_entry").inc()
     entry_id = int(entry_payload["id"])
     client = MinifluxClient(settings)
@@ -95,7 +100,7 @@ async def fetch_and_upsert_entry_activity(entry_payload: dict[str, object]) -> i
         return db_entry_id
 
 
-def _payload_to_entry(payload: dict[str, object]) -> dict[str, object]:
+def _payload_to_entry(payload: MinifluxEntryPayload) -> dict[str, Any]:
     published = payload.get("published_at")
     published_at = None
     if isinstance(published, str):
@@ -112,7 +117,7 @@ def _payload_to_entry(payload: dict[str, object]) -> dict[str, object]:
 
 
 @activity.defn
-async def summarize_entry_activity(entry_id: int) -> dict[str, object]:
+async def summarize_entry_activity(entry_id: int) -> dict[str, Any]:
     TASKS_TOTAL.labels(type="summarize_entry").inc()
     async with SessionFactory() as session:
         entry = await get_entry_for_processing(session, entry_id)
@@ -135,7 +140,7 @@ async def summarize_entry_activity(entry_id: int) -> dict[str, object]:
 
 
 @activity.defn
-async def score_entry_activity(entry_id: int) -> dict[str, object]:
+async def score_entry_activity(entry_id: int) -> dict[str, Any]:
     TASKS_TOTAL.labels(type="score_entry").inc()
     async with SessionFactory() as session:
         entry = await get_entry_for_processing(session, entry_id)
@@ -156,7 +161,7 @@ async def score_entry_activity(entry_id: int) -> dict[str, object]:
 
 
 @activity.defn
-async def verify_entry_activity(entry_id: int) -> dict[str, object]:
+async def verify_entry_activity(entry_id: int) -> dict[str, Any]:
     TASKS_TOTAL.labels(type="verify_entry").inc()
     async with SessionFactory() as session:
         entry = await get_entry_for_processing(session, entry_id)
@@ -270,7 +275,7 @@ def _extract_links(summary_json: dict[str, object]) -> list[dict[str, str]]:
 
 
 @activity.defn
-async def build_digest_activity() -> dict[str, object]:
+async def build_digest_activity() -> dict[str, Any]:
     TASKS_TOTAL.labels(type="build_digest").inc()
     async with SessionFactory() as session:
         latest = await get_latest_report(session)
@@ -335,7 +340,7 @@ async def send_digest_activity(markdown: str) -> None:
 
 
 @activity.defn
-async def generate_chat_answer_activity(question: str) -> dict[str, object]:
+async def generate_chat_answer_activity(question: str) -> dict[str, Any]:
     TASKS_TOTAL.labels(type="generate_chat_answer").inc()
     async with SessionFactory() as session:
         rows = await query_for_rag(session, question, limit=5)

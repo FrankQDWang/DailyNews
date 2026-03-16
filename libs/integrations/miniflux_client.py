@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import TypedDict
 
 import httpx
 
@@ -16,6 +17,16 @@ class MinifluxEntry:
     url: str
     author: str | None
     published_at: datetime | None
+    content: str | None
+
+
+class MinifluxEntryPayload(TypedDict):
+    id: int
+    feed_id: int | None
+    title: str
+    url: str
+    author: str | None
+    published_at: str | None
     content: str | None
 
 
@@ -51,8 +62,19 @@ class MinifluxClient:
         return _parse_entry(data)
 
 
-def serialize_entries(entries: list[MinifluxEntry]) -> list[dict[str, object]]:
-    return [asdict(entry) for entry in entries]
+def serialize_entries(entries: list[MinifluxEntry]) -> list[MinifluxEntryPayload]:
+    return [
+        {
+            "id": entry.id,
+            "feed_id": entry.feed_id,
+            "title": entry.title,
+            "url": entry.url,
+            "author": entry.author,
+            "published_at": entry.published_at.isoformat() if entry.published_at is not None else None,
+            "content": entry.content,
+        }
+        for entry in entries
+    ]
 
 
 def _parse_entry(data: dict[str, object]) -> MinifluxEntry:
