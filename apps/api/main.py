@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Response, status
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from temporalio.client import Client as TemporalClient
 
-from libs.core.db.repositories import mark_telegram_update_processed
+from apps.api.dependencies import require_internal_admin
+from libs.core.db.repositories import get_debug_overview, mark_telegram_update_processed
 from libs.core.db.session import get_session
 from libs.core.logging import configure_logging
 from libs.core.metrics import TASKS_TOTAL
 from libs.core.rate_limit import SlidingWindowRateLimiter
 from libs.core.schemas.commands import parse_command
+from libs.core.schemas.debug import DebugOverviewResponse
 from libs.core.schemas.telegram import TelegramUpdate
 from libs.core.services.command_service import CommandService
 from libs.core.settings import Settings, get_settings
@@ -69,15 +71,9 @@ def create_app() -> FastAPI:
     @app.post("/internal/reprocess/{entry_id}")
     async def internal_reprocess(
         entry_id: int,
-        x_admin_user_id: int = Header(...),
-        x_internal_token: str = Header(...),
+        _: int = Depends(require_internal_admin),
         settings: Settings = Depends(get_settings),
     ) -> dict[str, str]:
-        if x_internal_token != settings.internal_api_token:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="invalid internal token")
-        if x_admin_user_id not in settings.telegram_admin_user_ids:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not admin")
-
         client = await TemporalClient.connect(settings.temporal_host, namespace=settings.temporal_namespace)
         workflow_id = f"manual-reprocess-{entry_id}"
         await client.start_workflow(
@@ -87,6 +83,13 @@ def create_app() -> FastAPI:
             task_queue=settings.temporal_task_queue_process,
         )
         return {"status": "started", "workflow_id": workflow_id}
+
+    @app.get("/internal/debug/overview", response_model=DebugOverviewResponse)
+    async def internal_debug_overview(
+        _: int = Depends(require_internal_admin),
+        db: AsyncSession = Depends(get_session),
+    ) -> DebugOverviewResponse:
+        return await get_debug_overview(db)
 
     @app.post("/telegram/webhook/{secret}")
     async def telegram_webhook(

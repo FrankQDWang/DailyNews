@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 
 from sqlalchemy import Select, delete, func, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -15,6 +16,16 @@ from libs.core.db.models import (
     Score,
     Summary,
     Verification,
+)
+from libs.core.schemas.debug import (
+    DebugCounts,
+    DebugEntryRow,
+    DebugOverviewResponse,
+    DebugProcessedUpdateRow,
+    DebugPushEventRow,
+    DebugScoreRow,
+    DebugSummaryRow,
+    DebugVerificationRow,
 )
 from libs.core.schemas.llm import L0SummaryOutput, L1ScoreOutput, L2VerifyOutput
 
@@ -333,3 +344,120 @@ async def mark_telegram_update_processed(session: AsyncSession, update_id: int) 
     created_id = await session.scalar(stmt)
     await session.commit()
     return created_id is not None
+
+
+def _enum_to_value(value: Enum | str) -> str:
+    if isinstance(value, Enum):
+        return str(value.value)
+    return str(value)
+
+
+async def _count_rows(session: AsyncSession, model: type[object]) -> int:
+    count = await session.scalar(select(func.count()).select_from(model))
+    return int(count or 0)
+
+
+async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
+    entry_count = await _count_rows(session, Entry)
+    summary_count = await _count_rows(session, Summary)
+    score_count = await _count_rows(session, Score)
+    verification_count = await _count_rows(session, Verification)
+    push_event_count = await _count_rows(session, PushEvent)
+    processed_update_count = await _count_rows(session, ProcessedTelegramUpdate)
+    daily_report_count = await _count_rows(session, DailyReport)
+
+    entries_result = await session.execute(select(Entry).order_by(Entry.created_at.desc()).limit(5))
+    summaries_result = await session.execute(select(Summary).order_by(Summary.created_at.desc()).limit(5))
+    scores_result = await session.execute(select(Score).order_by(Score.created_at.desc()).limit(5))
+    verifications_result = await session.execute(
+        select(Verification).order_by(Verification.created_at.desc()).limit(5)
+    )
+    push_events_result = await session.execute(
+        select(PushEvent).order_by(PushEvent.created_at.desc()).limit(5)
+    )
+    processed_updates_result = await session.execute(
+        select(ProcessedTelegramUpdate).order_by(ProcessedTelegramUpdate.created_at.desc()).limit(5)
+    )
+
+    recent_entries = [
+        DebugEntryRow(
+            id=int(entry.id),
+            miniflux_entry_id=int(entry.miniflux_entry_id),
+            title=str(entry.title),
+            status=_enum_to_value(entry.status),
+            published_at=entry.published_at,
+            created_at=entry.created_at,
+            updated_at=entry.updated_at,
+            error=entry.error,
+        )
+        for entry in list(entries_result.scalars().all())[:5]
+    ]
+    recent_summaries = [
+        DebugSummaryRow(
+            entry_id=int(summary.entry_id),
+            summary_confidence=float(summary.summary_confidence),
+            model=str(summary.model),
+            created_at=summary.created_at,
+        )
+        for summary in list(summaries_result.scalars().all())[:5]
+    ]
+    recent_scores = [
+        DebugScoreRow(
+            entry_id=int(score.entry_id),
+            grade=_enum_to_value(score.grade),
+            overall=float(score.overall),
+            push_recommended=bool(score.push_recommended),
+            created_at=score.created_at,
+        )
+        for score in list(scores_result.scalars().all())[:5]
+    ]
+    recent_verifications = [
+        DebugVerificationRow(
+            entry_id=int(verification.entry_id),
+            verdict=_enum_to_value(verification.verdict),
+            confidence=float(verification.confidence),
+            created_at=verification.created_at,
+        )
+        for verification in list(verifications_result.scalars().all())[:5]
+    ]
+    recent_push_events = [
+        DebugPushEventRow(
+            id=int(push_event.id),
+            entry_id=int(push_event.entry_id) if push_event.entry_id is not None else None,
+            type=_enum_to_value(push_event.type),
+            status=_enum_to_value(push_event.status),
+            telegram_chat_id=int(push_event.telegram_chat_id),
+            telegram_message_id=(
+                int(push_event.telegram_message_id) if push_event.telegram_message_id is not None else None
+            ),
+            created_at=push_event.created_at,
+            error=push_event.error,
+        )
+        for push_event in list(push_events_result.scalars().all())[:5]
+    ]
+    recent_processed_updates = [
+        DebugProcessedUpdateRow(
+            update_id=int(processed_update.update_id),
+            created_at=processed_update.created_at,
+        )
+        for processed_update in list(processed_updates_result.scalars().all())[:5]
+    ]
+
+    return DebugOverviewResponse(
+        generated_at=_utc_now(),
+        counts=DebugCounts(
+            entries=entry_count,
+            summaries=summary_count,
+            scores=score_count,
+            verifications=verification_count,
+            push_events=push_event_count,
+            processed_telegram_updates=processed_update_count,
+            daily_reports=daily_report_count,
+        ),
+        recent_entries=recent_entries,
+        recent_summaries=recent_summaries,
+        recent_scores=recent_scores,
+        recent_verifications=recent_verifications,
+        recent_push_events=recent_push_events,
+        recent_processed_updates=recent_processed_updates,
+    )
