@@ -10,6 +10,7 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 from pgvector.sqlalchemy import Vector
+from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision = "0001_initial"
@@ -21,16 +22,37 @@ depends_on = None
 def upgrade() -> None:
     op.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
-    entry_status = sa.Enum(
-        "new", "summarized", "scored", "verified", "pushed", "failed", name="entry_status"
+    # Pre-create named enums and stop SQLAlchemy from trying to re-create them
+    # during table DDL. This keeps the initial migration rerunnable on a partially
+    # initialized database.
+    entry_status = postgresql.ENUM(
+        "new",
+        "summarized",
+        "scored",
+        "verified",
+        "pushed",
+        "failed",
+        name="entry_status",
+        create_type=False,
     )
-    grade = sa.Enum("A", "B", "C", name="grade")
-    verification_verdict = sa.Enum(
-        "verified", "partially_verified", "uncertain", name="verification_verdict"
+    grade = postgresql.ENUM("A", "B", "C", name="grade", create_type=False)
+    verification_verdict = postgresql.ENUM(
+        "verified",
+        "partially_verified",
+        "uncertain",
+        name="verification_verdict",
+        create_type=False,
     )
-    push_type = sa.Enum("alert", "digest", "reply", name="push_type")
-    push_status = sa.Enum("sent", "failed", name="push_status")
-    feedback_type = sa.Enum("up", "down", "save", "mute_source", name="feedback_type")
+    push_type = postgresql.ENUM("alert", "digest", "reply", name="push_type", create_type=False)
+    push_status = postgresql.ENUM("sent", "failed", name="push_status", create_type=False)
+    feedback_type = postgresql.ENUM(
+        "up",
+        "down",
+        "save",
+        "mute_source",
+        name="feedback_type",
+        create_type=False,
+    )
 
     entry_status.create(op.get_bind(), checkfirst=True)
     grade.create(op.get_bind(), checkfirst=True)

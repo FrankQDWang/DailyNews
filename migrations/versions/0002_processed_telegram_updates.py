@@ -18,6 +18,11 @@ depends_on = None
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    if inspector.has_table("processed_telegram_updates"):
+        return
+
     op.create_table(
         "processed_telegram_updates",
         sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
