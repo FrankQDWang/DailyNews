@@ -1,3 +1,5 @@
+from typing import cast
+
 from libs.core.settings import Settings
 
 
@@ -30,3 +32,10 @@ def test_settings_postgres_scheme_normalization() -> None:
     settings = Settings.model_validate(env)
     assert settings.assistant_db_async_url == 'postgresql+asyncpg://u:p@db.internal:5432/railway?sslmode=disable'
     assert settings.assistant_db_sync_url == 'postgresql://u:p@db.internal:5432/railway?sslmode=disable'
+
+
+def test_settings_admin_id_parse_from_int() -> None:
+    env = cast(dict[str, object], _base_env())
+    env['TELEGRAM_ADMIN_USER_IDS'] = 7
+    settings = Settings.model_validate(env)
+    assert settings.telegram_admin_user_ids == [7]

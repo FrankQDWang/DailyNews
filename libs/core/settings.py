@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     def _parse_admins(cls, value: object) -> list[int]:
         if isinstance(value, list):
             return [int(item) for item in value]
+        if isinstance(value, int):
+            return [value]
         if isinstance(value, str):
             return [int(chunk.strip()) for chunk in value.split(",") if chunk.strip()]
         raise ValueError("TELEGRAM_ADMIN_USER_IDS must be comma-separated ids")

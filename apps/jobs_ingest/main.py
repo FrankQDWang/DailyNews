@@ -1,7 +1,14 @@
 from __future__ import annotations
+# ruff: noqa: E402, I001
 
 import asyncio
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from temporalio.client import Client
 
