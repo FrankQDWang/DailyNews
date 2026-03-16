@@ -27,7 +27,7 @@ def test_serialize_entries_from_dataclass() -> None:
             "title": "Test entry",
             "url": "https://example.com/post",
             "author": "Tester",
-            "published_at": datetime(2026, 3, 16, 3, 0, tzinfo=UTC),
+            "published_at": "2026-03-16T03:00:00+00:00",
             "content": "hello",
         }
     ]
