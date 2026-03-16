@@ -44,6 +44,7 @@ async def refresh_miniflux_activity() -> None:
     client = MinifluxClient(settings)
     try:
         await client.refresh_feeds()
+        logger.info("Miniflux refresh completed")
     finally:
         await client.close()
 
@@ -58,6 +59,7 @@ async def list_unread_miniflux_activity(limit: int = 100) -> list[dict[str, obje
         await client.close()
 
     NEW_ENTRIES_FOUND.inc(len(entries))
+    logger.info("Fetched %d unread Miniflux entries", len(entries))
     return serialize_entries(entries)
 
 
@@ -77,7 +79,7 @@ async def fetch_and_upsert_entry_activity(entry_payload: dict[str, object]) -> i
     src = fetched if fetched is not None else _payload_to_entry(entry_payload)
 
     async with SessionFactory() as session:
-        return await upsert_entry(
+        db_entry_id = await upsert_entry(
             session,
             miniflux_entry_id=src["id"],
             miniflux_feed_id=src["feed_id"],
@@ -89,6 +91,8 @@ async def fetch_and_upsert_entry_activity(entry_payload: dict[str, object]) -> i
             content_html=src["content"],
             content_text=src["content"],
         )
+        logger.info("Upserted Miniflux entry %s as database entry %s", src["id"], db_entry_id)
+        return db_entry_id
 
 
 def _payload_to_entry(payload: dict[str, object]) -> dict[str, object]:
