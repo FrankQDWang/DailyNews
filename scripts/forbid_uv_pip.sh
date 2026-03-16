@@ -19,7 +19,11 @@ else
   )
 fi
 
-if "${search_cmd[@]}" > /tmp/uv_pip_hits.txt; then
+if "${search_cmd[@]}" > /tmp/uv_pip_hits_raw.txt; then
+  grep -v "Enforce no uv pip" /tmp/uv_pip_hits_raw.txt > /tmp/uv_pip_hits.txt || true
+fi
+
+if [[ -s /tmp/uv_pip_hits.txt ]]; then
   echo "ERROR: Found forbidden 'uv pip' usage:"
   cat /tmp/uv_pip_hits.txt
   exit 1
