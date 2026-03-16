@@ -48,10 +48,10 @@ Use this file to track complex implementation plans before coding.
 4. Add route/repository tests and run lint, typecheck, and pytest.
 
 ### Acceptance
-- [ ] `GET /internal/debug/overview` returns `403` for invalid internal access and `200` for valid admin headers.
-- [ ] Response includes fixed counts and recent rows for the required tables.
-- [ ] Response is JSON-safe and does not expose ORM objects or secrets.
-- [ ] Automated tests cover empty and populated snapshot cases.
+- [x] `GET /internal/debug/overview` returns `403` for invalid internal access and `200` for valid admin headers.
+- [x] Response includes fixed counts and recent rows for the required tables.
+- [x] Response is JSON-safe and does not expose ORM objects or secrets.
+- [x] Automated tests cover empty and populated snapshot cases.
 
 ### Risks & Rollback
 - Risk: The snapshot query could accidentally expose oversized or sensitive fields if it returns ORM objects directly.
