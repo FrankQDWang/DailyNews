@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
@@ -58,7 +59,7 @@ async def list_unread_miniflux_activity(limit: int = 100) -> list[dict[str, obje
         await client.close()
 
     NEW_ENTRIES_FOUND.inc(len(entries))
-    return [entry.__dict__ for entry in entries]
+    return [asdict(entry) for entry in entries]
 
 
 @activity.defn
