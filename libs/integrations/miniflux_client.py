@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 
 import httpx
@@ -49,6 +49,10 @@ class MinifluxClient:
         resp.raise_for_status()
         data = resp.json().get("entry", resp.json())
         return _parse_entry(data)
+
+
+def serialize_entries(entries: list[MinifluxEntry]) -> list[dict[str, object]]:
+    return [asdict(entry) for entry in entries]
 
 
 def _parse_entry(data: dict[str, object]) -> MinifluxEntry:

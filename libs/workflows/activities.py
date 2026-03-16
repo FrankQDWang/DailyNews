@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
@@ -27,7 +26,7 @@ from libs.core.db.session import SessionFactory
 from libs.core.metrics import MINIFLUX_FETCH_CONTENT_FAILURES, NEW_ENTRIES_FOUND, TASKS_TOTAL
 from libs.core.settings import get_settings
 from libs.integrations.deepseek_client import DeepSeekClient
-from libs.integrations.miniflux_client import MinifluxClient
+from libs.integrations.miniflux_client import MinifluxClient, serialize_entries
 from libs.integrations.tavily_client import TavilyClient
 from libs.integrations.telegram_client import TelegramClient
 
@@ -59,7 +58,7 @@ async def list_unread_miniflux_activity(limit: int = 100) -> list[dict[str, obje
         await client.close()
 
     NEW_ENTRIES_FOUND.inc(len(entries))
-    return [asdict(entry) for entry in entries]
+    return serialize_entries(entries)
 
 
 @activity.defn
