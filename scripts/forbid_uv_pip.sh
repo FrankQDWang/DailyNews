@@ -1,12 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if rg -n "uv\\s+pip" . \
-  --glob '!uv.lock' \
-  --glob '!.venv/**' \
-  --glob '!**/*.md' \
-  --glob '!scripts/forbid_uv_pip.sh' \
-  > /tmp/uv_pip_hits.txt; then
+if command -v rg >/dev/null 2>&1; then
+  search_cmd=(
+    rg -n "uv\\s+pip" .
+    --glob '!uv.lock'
+    --glob '!.venv/**'
+    --glob '!**/*.md'
+    --glob '!scripts/forbid_uv_pip.sh'
+  )
+else
+  search_cmd=(
+    grep -RInE "uv[[:space:]]+pip" .
+    --exclude=uv.lock
+    --exclude-dir=.venv
+    --exclude=forbid_uv_pip.sh
+    --exclude='*.md'
+  )
+fi
+
+if "${search_cmd[@]}" > /tmp/uv_pip_hits.txt; then
   echo "ERROR: Found forbidden 'uv pip' usage:"
   cat /tmp/uv_pip_hits.txt
   exit 1
