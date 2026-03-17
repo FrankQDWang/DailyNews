@@ -25,8 +25,8 @@ def test_settings_admin_id_parse() -> None:
     assert settings.assistant_db_async_url == 'postgresql+asyncpg://u:p@localhost:5432/db'
     assert settings.assistant_db_sync_url == 'postgresql://u:p@localhost:5432/db'
     assert settings.push_window_hours == 24
-    assert settings.miniflux_scan_limit == 300
-    assert settings.ingest_actionable_limit == 30
+    assert settings.miniflux_scan_limit == 200
+    assert settings.ingest_actionable_limit == 15
 
 
 def test_settings_postgres_scheme_normalization() -> None:
