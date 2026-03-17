@@ -8,3 +8,4 @@
 - Add verification audit state, backfill historical scored rows, and expose push-gate reasons plus recent A-grade candidates in the internal debug snapshot.
 - Make ingest metadata-first, add fetch cooldown/block state plus `too_short_content` quarantine, cap each ingest run to `scan 300 / process 30`, and record per-task LLM token usage in the debug snapshot and Prometheus metrics.
 - Move unread metadata processing into a dedicated batch activity, persist `latest_ingest_batch`, and remove the large unread payload from the Temporal workflow boundary.
+- Set `ProcessEntryWorkflow` child launches to `ParentClosePolicy.ABANDON` so completed ingest batches no longer terminate in-flight process children.

@@ -5,6 +5,7 @@ from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
     from libs.core.settings import get_settings
@@ -50,6 +51,7 @@ class IngestBatchWorkflow:
                 entry_id,
                 id=f"process-entry-{entry_id}-{workflow.info().run_id[:8]}",
                 task_queue="process",
+                parent_close_policy=ParentClosePolicy.ABANDON,
             )
         return entry_ids
 

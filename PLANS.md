@@ -194,6 +194,31 @@ Use this file to track complex implementation plans before coding.
 - Risk: Batch read-sync now happens earlier in the ingest path, so a bug there could undercount `marked_read_count` even though processing still continues.
 - Rollback: Revert the new batch activity, migration, and workflow wiring, then temporarily lower `MINIFLUX_SCAN_LIMIT` while a safer payload reduction strategy is prepared.
 
+## 2026-03-17 Child Workflow Close Policy Fix
+
+### Context
+- Problem: After the batch-payload fix shipped, `IngestBatchWorkflow` began completing successfully, but the `ProcessEntryWorkflow` children it launched were immediately terminated because `start_child_workflow(...)` used the default parent close policy. Production Temporal data showed `IngestBatchWorkflow` status `COMPLETED`, while same-batch `ProcessEntryWorkflow` executions closed with status `TERMINATED`.
+- Scope: Keep the current `scan 300 / process 30` behavior, but allow process children to outlive the parent ingest batch so scoring, read-sync, and cooldown logic can finish.
+- Constraints: Minimal production fix only; do not change public APIs, do not rework batch semantics again, and keep the ingest batch workflow result shape unchanged.
+
+### Decisions
+- Decision 1: `IngestBatchWorkflow` now starts `ProcessEntryWorkflow` with `ParentClosePolicy.ABANDON`.
+- Decision 2: Add a focused workflow regression test rather than introducing a larger Temporal integration harness.
+
+### Steps
+1. Update `libs/workflows/workflows.py` to pass `parent_close_policy=ParentClosePolicy.ABANDON` when starting process children.
+2. Add `tests/unit/test_workflows.py` to assert the child start call carries the expected close policy.
+3. Re-run lint, mypy, pytest, and then redeploy and verify that post-fix `ProcessEntryWorkflow` children are no longer terminated by parent completion.
+
+### Acceptance
+- [x] `IngestBatchWorkflow` still returns actionable `entry_id`s.
+- [x] Child process workflows are started with `ParentClosePolicy.ABANDON`.
+- [x] Regression test covers the close-policy behavior.
+
+### Risks & Rollback
+- Risk: Abandoned children will continue independently, so if a later bug causes runaway process workflows, they will no longer be automatically cleaned up by parent completion.
+- Rollback: Revert the close-policy change and temporarily switch the parent workflow to await child completions directly if abandonment proves unsafe.
+
 ## Template
 
 ### Context
