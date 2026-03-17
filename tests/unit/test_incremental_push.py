@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import sys
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -7,9 +9,8 @@ from typing import Any
 import httpx
 
 from libs.core.db.enums import EntryStatus, Grade
-from libs.core.settings import Settings
+from libs.core.settings import Settings, get_settings
 from libs.integrations.miniflux_client import MinifluxClient, MinifluxEntry, MinifluxEntryPayload
-from libs.workflows import activities
 
 
 def _base_env() -> dict[str, str]:
@@ -22,7 +23,7 @@ def _base_env() -> dict[str, str]:
         "TELEGRAM_BOT_TOKEN": "x",
         "TELEGRAM_WEBHOOK_SECRET": "secret",
         "TELEGRAM_TARGET_CHAT_ID": "-10001",
-        "TELEGRAM_ADMIN_USER_IDS": "1,2,3",
+        "TELEGRAM_ADMIN_USER_IDS": "[1, 2, 3]",
         "INTERNAL_API_TOKEN": "internal",
     }
 
@@ -55,8 +56,21 @@ class _FakeSession:
         return _FakeExecuteResult([object()] * self._pushed_today)
 
 
+def _load_activities_module(monkeypatch: Any) -> Any:
+    for key, value in _base_env().items():
+        monkeypatch.setenv(key, value)
+
+    get_settings.cache_clear()
+    for module_name in ("libs.workflows.activities", "libs.core.db.session"):
+        sys.modules.pop(module_name, None)
+
+    return importlib.import_module("libs.workflows.activities")
+
+
 async def test_miniflux_mark_entries_read_uses_bulk_endpoint() -> None:
     seen: dict[str, Any] = {}
+    env = _base_env()
+    env["TELEGRAM_ADMIN_USER_IDS"] = "1,2,3"
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen["method"] = request.method
@@ -64,7 +78,7 @@ async def test_miniflux_mark_entries_read_uses_bulk_endpoint() -> None:
         seen["body"] = request.content.decode("utf-8")
         return httpx.Response(status_code=204)
 
-    client = MinifluxClient(Settings.model_validate(_base_env()))
+    client = MinifluxClient(Settings.model_validate(env))
     await client.close()
     client._client = httpx.AsyncClient(
         transport=httpx.MockTransport(handler),
@@ -84,6 +98,7 @@ async def test_miniflux_mark_entries_read_uses_bulk_endpoint() -> None:
 
 
 async def test_fetch_and_upsert_entry_activity_returns_terminal_entry_contract(monkeypatch: Any) -> None:
+    activities = _load_activities_module(monkeypatch)
     payload: MinifluxEntryPayload = {
         "id": 123,
         "feed_id": 9,
@@ -138,6 +153,7 @@ async def test_fetch_and_upsert_entry_activity_returns_terminal_entry_contract(m
 
 
 async def test_should_push_activity_rejects_historical_entries(monkeypatch: Any) -> None:
+    activities = _load_activities_module(monkeypatch)
     now = datetime.now(UTC)
     entry = SimpleNamespace(
         id=1,
@@ -165,6 +181,7 @@ async def test_should_push_activity_rejects_historical_entries(monkeypatch: Any)
 
 
 async def test_should_push_activity_uses_created_at_fallback(monkeypatch: Any) -> None:
+    activities = _load_activities_module(monkeypatch)
     now = datetime.now(UTC)
     entry = SimpleNamespace(
         id=1,
@@ -193,6 +210,7 @@ async def test_should_push_activity_uses_created_at_fallback(monkeypatch: Any) -
 
 
 async def test_mark_entry_read_activity_returns_false_when_miniflux_fails(monkeypatch: Any) -> None:
+    activities = _load_activities_module(monkeypatch)
     session = object()
     entry = SimpleNamespace(id=7, miniflux_entry_id=701)
 
