@@ -6,10 +6,13 @@ import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 from sqlalchemy import select
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
 from libs.core.db.enums import (
+    ContentFetchState,
     EntryStatus,
     Grade,
     PushStatus,
@@ -23,11 +26,14 @@ from libs.core.db.repositories import (
     get_entry_for_processing,
     get_latest_report,
     get_score,
+    get_summary,
     mark_entry_failed,
     mark_entry_pushed,
     quarantine_entry,
     query_for_rag,
+    record_content_fetch_failure,
     save_daily_report,
+    save_entry_content,
     save_score,
     save_summary,
     save_verification,
@@ -35,7 +41,14 @@ from libs.core.db.repositories import (
     upsert_entry,
 )
 from libs.core.db.session import SessionFactory
-from libs.core.metrics import MINIFLUX_FETCH_CONTENT_FAILURES, NEW_ENTRIES_FOUND, TASKS_TOTAL
+from libs.core.metrics import (
+    MINIFLUX_FETCH_CONTENT_ATTEMPT_TOTAL,
+    MINIFLUX_FETCH_CONTENT_BLOCKED_TOTAL,
+    MINIFLUX_FETCH_CONTENT_FAILURES,
+    MINIFLUX_FETCH_CONTENT_SKIPPED_TOTAL,
+    NEW_ENTRIES_FOUND,
+    TASKS_TOTAL,
+)
 from libs.core.settings import get_settings
 from libs.integrations.deepseek_client import DeepSeekClient
 from libs.integrations.miniflux_client import (
@@ -54,7 +67,12 @@ PROCESSABLE_ENTRY_STATUSES = frozenset(
     {EntryStatus.NEW, EntryStatus.SUMMARIZED, EntryStatus.FAILED}
 )
 EMPTY_CONTENT_REASON = "empty_content"
+TOO_SHORT_CONTENT_REASON = "too_short_content"
 ZERO_WIDTH_CHARS = ("\u200b", "\u200c", "\u200d", "\ufeff")
+MIN_CONTENT_LENGTH = 280
+FETCH_SKIP_REASON_TERMINAL = "terminal_status"
+FETCH_SKIP_REASON_COOLDOWN = "cooldown"
+FETCH_SKIP_REASON_BLOCKED = "blocked"
 PUSH_DECISION_REASON_NON_A = "non_a"
 PUSH_DECISION_REASON_OUTSIDE_WINDOW = "outside_push_window"
 PUSH_DECISION_REASON_DAILY_CAP = "daily_cap_reached"
@@ -95,17 +113,7 @@ async def fetch_and_upsert_entry_activity(
     entry_payload: MinifluxEntryPayload,
 ) -> dict[str, str | int | bool | None] | int:
     TASKS_TOTAL.labels(type="fetch_and_upsert_entry").inc()
-    entry_id = int(entry_payload["id"])
-    client = MinifluxClient(settings)
-    try:
-        fetched = await client.fetch_content(entry_id)
-    except Exception:  # noqa: BLE001
-        MINIFLUX_FETCH_CONTENT_FAILURES.inc()
-        fetched = None
-    finally:
-        await client.close()
-
-    src = _miniflux_entry_to_record(fetched) if fetched is not None else _payload_to_entry(entry_payload)
+    src = _payload_to_entry(entry_payload)
 
     async with SessionFactory() as session:
         db_entry_id = await upsert_entry(
@@ -116,27 +124,83 @@ async def fetch_and_upsert_entry_activity(
             title=src["title"],
             author=src["author"],
             published_at=src["published_at"],
-            fetched_at=datetime.now(UTC),
+            fetched_at=None,
             content_html=src["content"],
             content_text=src["content"],
         )
         db_entry = await get_entry_for_processing(session, db_entry_id)
         if db_entry is None:
             raise RuntimeError(f"Entry not found after upsert: {db_entry_id}")
-        if _is_empty_content(src["content"]):
-            if (
-                db_entry.status != EntryStatus.QUARANTINED
-                or db_entry.quarantine_reason != EMPTY_CONTENT_REASON
+        ingest_result = _build_ingest_entry_result(db_entry)
+        if not ingest_result["needs_processing"]:
+            if db_entry.content_fetch_state == ContentFetchState.BLOCKED:
+                MINIFLUX_FETCH_CONTENT_SKIPPED_TOTAL.labels(reason=FETCH_SKIP_REASON_BLOCKED).inc()
+            elif (
+                db_entry.content_fetch_state == ContentFetchState.COOLDOWN
+                and db_entry.next_content_fetch_after is not None
+                and db_entry.next_content_fetch_after > datetime.now(UTC)
             ):
-                await quarantine_entry(session, db_entry_id, EMPTY_CONTENT_REASON)
+                MINIFLUX_FETCH_CONTENT_SKIPPED_TOTAL.labels(reason=FETCH_SKIP_REASON_COOLDOWN).inc()
+            else:
+                MINIFLUX_FETCH_CONTENT_SKIPPED_TOTAL.labels(reason=FETCH_SKIP_REASON_TERMINAL).inc()
+            logger.info(
+                "Skipped fetch-content for database entry %s status=%s fetch_state=%s",
+                db_entry_id,
+                db_entry.status.value,
+                db_entry.content_fetch_state.value,
+            )
+            return ingest_result
+
+        fetched = await _fetch_content_from_miniflux(src["id"])
+        if isinstance(fetched, Exception):
+            if _is_retryable_fetch_failure(fetched):
+                MINIFLUX_FETCH_CONTENT_FAILURES.inc()
+                next_state = await record_content_fetch_failure(
+                    session,
+                    db_entry_id,
+                    error=_format_fetch_error(fetched),
+                    at=datetime.now(UTC),
+                )
+                if next_state == ContentFetchState.BLOCKED:
+                    MINIFLUX_FETCH_CONTENT_BLOCKED_TOTAL.inc()
                 db_entry = await get_entry_for_processing(session, db_entry_id)
                 if db_entry is None:
-                    raise RuntimeError(f"Entry not found after quarantine: {db_entry_id}")
-                logger.info(
-                    "Quarantined entry %s due to %s", db_entry_id, EMPTY_CONTENT_REASON
+                    raise RuntimeError(f"Entry not found after fetch failure: {db_entry_id}")
+                logger.warning(
+                    "Fetch-content failed for entry %s; state=%s error=%s",
+                    db_entry_id,
+                    next_state.value,
+                    fetched,
                 )
+                return _build_ingest_entry_result(db_entry)
+            raise fetched
+
+        fetched_record = _miniflux_entry_to_record(fetched)
+        await save_entry_content(
+            session,
+            db_entry_id,
+            content_html=fetched_record["content"],
+            content_text=fetched_record["content"],
+            fetched_at=datetime.now(UTC),
+        )
+        db_entry = await get_entry_for_processing(session, db_entry_id)
+        if db_entry is None:
+            raise RuntimeError(f"Entry not found after saving fetched content: {db_entry_id}")
+        if _is_empty_content(fetched_record["content"]):
+            await quarantine_entry(session, db_entry_id, EMPTY_CONTENT_REASON)
+            db_entry = await get_entry_for_processing(session, db_entry_id)
+            if db_entry is None:
+                raise RuntimeError(f"Entry not found after quarantine: {db_entry_id}")
+            logger.info("Quarantined entry %s due to %s", db_entry_id, EMPTY_CONTENT_REASON)
             return _build_ingest_entry_result(db_entry)
-        logger.info("Upserted Miniflux entry %s as database entry %s", src["id"], db_entry_id)
+        if _is_too_short_content(fetched_record["content"]):
+            await quarantine_entry(session, db_entry_id, TOO_SHORT_CONTENT_REASON)
+            db_entry = await get_entry_for_processing(session, db_entry_id)
+            if db_entry is None:
+                raise RuntimeError(f"Entry not found after quarantine: {db_entry_id}")
+            logger.info("Quarantined entry %s due to %s", db_entry_id, TOO_SHORT_CONTENT_REASON)
+            return _build_ingest_entry_result(db_entry)
+        logger.info("Fetched and upserted Miniflux entry %s as database entry %s", src["id"], db_entry_id)
         return _build_ingest_entry_result(db_entry)
 
 
@@ -174,12 +238,47 @@ def _build_ingest_entry_result(entry: Entry) -> IngestEntryResult:
         "miniflux_entry_id": int(entry.miniflux_entry_id),
         "published_at": entry.published_at.isoformat() if entry.published_at is not None else None,
         "current_status": entry.status.value,
-        "needs_processing": _needs_processing(entry.status),
+        "needs_processing": _needs_processing(entry.status) and _fetch_content_is_actionable(entry),
+        "should_mark_read": _should_mark_read_without_processing(entry),
     }
+
+
+async def _fetch_content_from_miniflux(entry_id: int) -> MinifluxEntry | Exception:
+    MINIFLUX_FETCH_CONTENT_ATTEMPT_TOTAL.inc()
+    client = MinifluxClient(settings)
+    try:
+        return await client.fetch_content(entry_id)
+    except Exception as exc:  # noqa: BLE001
+        return exc
+    finally:
+        await client.close()
 
 
 def _needs_processing(status: EntryStatus) -> bool:
     return status in PROCESSABLE_ENTRY_STATUSES
+
+
+def _should_mark_read_without_processing(entry: Entry) -> bool:
+    if entry.status in {
+        EntryStatus.SCORED,
+        EntryStatus.VERIFIED,
+        EntryStatus.PUSHED,
+        EntryStatus.QUARANTINED,
+    }:
+        return True
+    if entry.content_fetch_state == ContentFetchState.BLOCKED:
+        return True
+    return False
+
+
+def _fetch_content_is_actionable(entry: Entry) -> bool:
+    if entry.content_fetch_state == ContentFetchState.READY:
+        return True
+    if entry.content_fetch_state != ContentFetchState.COOLDOWN:
+        return False
+    if entry.next_content_fetch_after is None:
+        return True
+    return entry.next_content_fetch_after <= datetime.now(UTC)
 
 
 def _entry_reference_time(entry: Entry) -> datetime:
@@ -205,6 +304,34 @@ def _normalize_content(raw: str | None) -> str:
 
 def _is_empty_content(raw: str | None) -> bool:
     return _normalize_content(raw) == ""
+
+
+def _normalized_content_length(raw: str | None) -> int:
+    return len(_normalize_content(raw))
+
+
+def _is_too_short_content(raw: str | None) -> bool:
+    normalized = _normalize_content(raw)
+    return normalized != "" and len(normalized) < MIN_CONTENT_LENGTH
+
+
+def _is_retryable_fetch_failure(exc: Exception) -> bool:
+    if isinstance(exc, httpx.TimeoutException | httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        return status_code == 429 or 500 <= status_code < 600
+    return False
+
+
+def _format_fetch_error(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"http_status:{exc.response.status_code}"
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.TransportError):
+        return f"transport:{exc.__class__.__name__}"
+    return str(exc)
 
 
 async def _sync_miniflux_read_for_entry(
@@ -254,17 +381,88 @@ async def summarize_entry_activity(entry_id: int) -> dict[str, Any]:
         entry = await get_entry_for_processing(session, entry_id)
         if not entry:
             raise RuntimeError(f"Entry not found: {entry_id}")
+        existing_summary = await get_summary(session, entry_id)
+        if existing_summary is not None:
+            return existing_summary.summary_json
+
+        if entry.content_fetch_state == ContentFetchState.BLOCKED:
+            raise ApplicationError(
+                f"Entry {entry_id} fetch-content is blocked",
+                non_retryable=True,
+            )
+        if (
+            entry.content_fetch_state == ContentFetchState.COOLDOWN
+            and entry.next_content_fetch_after is not None
+            and entry.next_content_fetch_after > datetime.now(UTC)
+        ):
+            raise ApplicationError(
+                f"Entry {entry_id} fetch-content is cooling down until {entry.next_content_fetch_after.isoformat()}",
+                non_retryable=True,
+            )
+        if _is_empty_content(entry.content_text) or entry.content_text is None:
+            fetched = await _fetch_content_from_miniflux(int(entry.miniflux_entry_id))
+            if isinstance(fetched, Exception):
+                if _is_retryable_fetch_failure(fetched):
+                    MINIFLUX_FETCH_CONTENT_FAILURES.inc()
+                    next_state = await record_content_fetch_failure(
+                        session,
+                        entry_id,
+                        error=_format_fetch_error(fetched),
+                        at=datetime.now(UTC),
+                    )
+                    entry = await get_entry_for_processing(session, entry_id)
+                    if entry is None:
+                        raise RuntimeError(f"Entry not found after summarize fetch failure: {entry_id}")
+                    if next_state == ContentFetchState.BLOCKED:
+                        MINIFLUX_FETCH_CONTENT_BLOCKED_TOTAL.inc()
+                        await _sync_miniflux_read_for_entry(entry, after_quarantine=False)
+                    raise ApplicationError(
+                        f"Entry {entry_id} fetch-content failed: {_format_fetch_error(fetched)}",
+                        non_retryable=True,
+                    )
+                raise fetched
+            fetched_record = _miniflux_entry_to_record(fetched)
+            await save_entry_content(
+                session,
+                entry_id,
+                content_html=fetched_record["content"],
+                content_text=fetched_record["content"],
+                fetched_at=datetime.now(UTC),
+            )
+            entry = await get_entry_for_processing(session, entry_id)
+            if entry is None:
+                raise RuntimeError(f"Entry not found after summarize fetch save: {entry_id}")
+
         if _is_empty_content(entry.content_text):
             await quarantine_entry(session, entry_id, EMPTY_CONTENT_REASON)
+            entry = await get_entry_for_processing(session, entry_id)
+            if entry is None:
+                raise RuntimeError(f"Entry not found after empty-content quarantine: {entry_id}")
             logger.info("Quarantined entry %s due to %s", entry_id, EMPTY_CONTENT_REASON)
             await _sync_miniflux_read_for_entry(entry, after_quarantine=True)
-            raise RuntimeError(f"Entry {entry_id} quarantined due to empty content")
+            raise ApplicationError(
+                f"Entry {entry_id} quarantined due to empty content",
+                non_retryable=True,
+            )
+        if _is_too_short_content(entry.content_text):
+            await quarantine_entry(session, entry_id, TOO_SHORT_CONTENT_REASON)
+            entry = await get_entry_for_processing(session, entry_id)
+            if entry is None:
+                raise RuntimeError(f"Entry not found after too-short quarantine: {entry_id}")
+            logger.info("Quarantined entry %s due to %s", entry_id, TOO_SHORT_CONTENT_REASON)
+            await _sync_miniflux_read_for_entry(entry, after_quarantine=True)
+            raise ApplicationError(
+                f"Entry {entry_id} quarantined due to too-short content",
+                non_retryable=True,
+            )
 
         client = DeepSeekClient(settings)
         try:
-            output = await client.summarize(entry.title, entry.url, entry.content_text)
-            await save_summary(session, entry_id, output, settings.llm_model_summary)
+            output, usage = await client.summarize(entry.title, entry.url, entry.content_text or "")
+            await save_summary(session, entry_id, output, settings.llm_model_summary, usage)
             return output.model_dump()
+        except ApplicationError:
+            raise
         except Exception as exc:  # noqa: BLE001
             await mark_entry_failed(session, entry_id, f"summarize failed: {exc}")
             raise
@@ -277,14 +475,32 @@ async def score_entry_activity(entry_id: int) -> dict[str, Any]:
     TASKS_TOTAL.labels(type="score_entry").inc()
     async with SessionFactory() as session:
         entry = await get_entry_for_processing(session, entry_id)
-        summary = await session.scalar(select(Summary).where(Summary.entry_id == entry_id))
+        summary = await get_summary(session, entry_id)
+        existing_score = await get_score(session, entry_id)
         if not entry or not summary:
             raise RuntimeError(f"Missing entry/summary for {entry_id}")
+        if existing_score is not None:
+            return {
+                "relevance": {
+                    "agents": existing_score.relevance_agents,
+                    "eval": existing_score.relevance_eval,
+                    "product": existing_score.relevance_product,
+                    "engineering": existing_score.relevance_engineering,
+                    "biz": existing_score.relevance_biz,
+                },
+                "novelty": existing_score.novelty,
+                "actionability": existing_score.actionability,
+                "credibility": existing_score.credibility,
+                "overall": existing_score.overall,
+                "grade": existing_score.grade.value,
+                "rationale": existing_score.rationale,
+                "push_recommended": existing_score.push_recommended,
+            }
 
         client = DeepSeekClient(settings)
         try:
-            output = await client.score(entry.title, entry.url, summary.summary_json)
-            await save_score(session, entry_id, output, settings.llm_model_score)
+            output, usage = await client.score(entry.title, entry.url, summary.summary_json)
+            await save_score(session, entry_id, output, settings.llm_model_score, usage)
             return output.model_dump()
         except Exception as exc:  # noqa: BLE001
             await mark_entry_failed(session, entry_id, f"score failed: {exc}")
@@ -305,7 +521,7 @@ async def mark_entry_read_activity(entry_id: int) -> bool:
         entry,
         after_quarantine=(
             entry.status == EntryStatus.QUARANTINED
-            and entry.quarantine_reason == EMPTY_CONTENT_REASON
+            and entry.quarantine_reason in {EMPTY_CONTENT_REASON, TOO_SHORT_CONTENT_REASON}
         ),
     )
 
@@ -326,7 +542,7 @@ async def verify_entry_activity(entry_id: int) -> dict[str, Any]:
 
         client = DeepSeekClient(settings)
         try:
-            output = await client.verify(
+            output, usage = await client.verify(
                 title=entry.title,
                 url=entry.url,
                 content_text=entry.content_text or "",
@@ -334,7 +550,7 @@ async def verify_entry_activity(entry_id: int) -> dict[str, Any]:
                 citations=citations,
                 fallback_evidence=fallback_evidence,
             )
-            await save_verification(session, entry_id, output, settings.llm_model_verify)
+            await save_verification(session, entry_id, output, settings.llm_model_verify, usage)
             logger.info("Verification completed for entry %s", entry_id)
             return output.model_dump()
         except Exception as exc:  # noqa: BLE001

@@ -23,6 +23,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from libs.core.db.base import Base
 from libs.core.db.enums import (
+    ContentFetchState,
     EntryStatus,
     FeedbackType,
     Grade,
@@ -63,6 +64,15 @@ class Entry(Base):
     )
     verification_reason: Mapped[str | None] = mapped_column(Text)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    content_fetch_state: Mapped[ContentFetchState] = mapped_column(
+        Enum(ContentFetchState, name="content_fetch_state", values_callable=_enum_values),
+        default=ContentFetchState.READY,
+        nullable=False,
+    )
+    content_fetch_fail_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_content_fetch_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_content_fetch_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_content_fetch_error: Mapped[str | None] = mapped_column(Text)
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -75,6 +85,8 @@ class Entry(Base):
 Index("ix_entries_published_at", Entry.published_at.desc())
 Index("ix_entries_status", Entry.status)
 Index("ix_entries_verification_state", Entry.verification_state)
+Index("ix_entries_content_fetch_state", Entry.content_fetch_state)
+Index("ix_entries_next_content_fetch_after", Entry.next_content_fetch_after)
 Index("ix_entries_feed_published", Entry.miniflux_feed_id, Entry.published_at)
 
 
@@ -113,6 +125,9 @@ class Summary(Base):
     summary_confidence: Mapped[float] = mapped_column(Float, nullable=False)
     summary_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
     model: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -140,6 +155,9 @@ class Score(Base):
     rationale: Mapped[str] = mapped_column(Text, nullable=False)
     push_recommended: Mapped[bool] = mapped_column(nullable=False)
     model: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -162,6 +180,9 @@ class Verification(Base):
     notes: Mapped[str] = mapped_column(Text, nullable=False)
     confidence: Mapped[float] = mapped_column(Float, nullable=False)
     model: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

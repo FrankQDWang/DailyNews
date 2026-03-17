@@ -138,6 +138,35 @@ Use this file to track complex implementation plans before coding.
 - Risk: Historical rows can only be backfilled using the fixed 24-hour window, not the exact runtime cap state from the original moment of scoring.
 - Rollback: Revert the verification audit migration and workflow/repository changes, then rely on raw `scores`, `verifications`, and `push_events` tables for investigation again.
 
+## 2026-03-17 Resource Optimization Phase 0-4
+
+### Context
+- Problem: Railway metrics and Miniflux logs showed the main waste is not `assistant-api`, but repeated `fetch-content`, large ingest fan-out, and unnecessary `summary/score` calls on the `miniflux -> ingest -> worker -> DeepSeek` path.
+- Scope: Implement phases 0-4 of the resource optimization plan: token telemetry, metadata-first ingest, fetch cooldown/block state, `scan 300 / process 30`, and `too_short_content` quarantine.
+- Constraints: Keep public HTTP and Telegram interfaces unchanged, preserve Temporal compatibility, and explicitly leave `summary + score` combined shadow mode for a later standalone phase.
+
+### Decisions
+- Decision 1: `fetch-content` now runs only for actionable entries; terminal, cooldown, and blocked rows never hit Miniflux full-content fetch in automatic ingest.
+- Decision 2: Persistent fetch failures move entries through `cooldown` to `blocked`, and `blocked` rows are read-synced out of Miniflux instead of repeatedly consuming the unread window.
+
+### Steps
+1. Add `content_fetch_state` + fetch failure metadata on `entries`, plus LLM token usage columns on `summaries/scores/verifications`.
+2. Rework ingest to be metadata-first and cap each run to `MINIFLUX_SCAN_LIMIT=300`, `INGEST_ACTIONABLE_LIMIT=30`.
+3. Quarantine `too_short_content` before LLM, extend debug overview and Prometheus metrics, and reset fetch state in `internal_reprocess`.
+4. Update tests and run lint, typecheck, pytest, and repository contract checks.
+
+### Acceptance
+- [x] Ingest skips `fetch-content` for terminal, cooldown, and blocked rows.
+- [x] Retryable `fetch-content` failures transition into `cooldown` / `blocked` instead of falling through to LLM.
+- [x] `scan 300 / process 30` is implemented in `IngestBatchWorkflow`.
+- [x] `too_short_content` is quarantined and read-synced like `empty_content`.
+- [x] Internal debug output includes fetch-state counts and 24-hour token totals.
+- [x] `POST /internal/reprocess/{entry_id}` clears fetch-state before rerun.
+
+### Risks & Rollback
+- Risk: Metadata-only ingest plus delayed full-content fetch changes when `content_text` is refreshed, which could expose latent assumptions in older reprocess flows.
+- Rollback: Revert the migration plus activity/workflow changes and restore the old eager `fetch-content` path if production verification shows missed recent entries.
+
 ## Template
 
 ### Context

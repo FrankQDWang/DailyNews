@@ -9,7 +9,14 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
-from libs.core.db.enums import EntryStatus, Grade, PushStatus, PushType, VerificationVerdict
+from libs.core.db.enums import (
+    ContentFetchState,
+    EntryStatus,
+    Grade,
+    PushStatus,
+    PushType,
+    VerificationVerdict,
+)
 from libs.core.db.repositories import get_debug_overview
 from libs.core.schemas.debug import DebugOverviewResponse
 from libs.core.settings import get_settings
@@ -66,12 +73,12 @@ def test_internal_debug_overview_rejects_invalid_internal_token(monkeypatch: Any
 
     with TestClient(main_module.app) as client:
         response = client.get(
-                "/internal/debug/overview",
-                headers={
-                    "x-internal-token": "wrong",
-                    "x-admin-user-id": "1",
-                },
-            )
+            "/internal/debug/overview",
+            headers={
+                "x-internal-token": "wrong",
+                "x-admin-user-id": "1",
+            },
+        )
 
     main_module.app.dependency_overrides.clear()
     assert response.status_code == 403
@@ -88,12 +95,12 @@ def test_internal_debug_overview_rejects_non_admin(monkeypatch: Any) -> None:
 
     with TestClient(main_module.app) as client:
         response = client.get(
-                "/internal/debug/overview",
-                headers={
-                    "x-internal-token": "internal",
-                    "x-admin-user-id": "99",
-                },
-            )
+            "/internal/debug/overview",
+            headers={
+                "x-internal-token": "internal",
+                "x-admin-user-id": "99",
+            },
+        )
 
     main_module.app.dependency_overrides.clear()
     assert response.status_code == 403
@@ -108,6 +115,9 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
             "counts": {
                 "entries": 1,
                 "quarantined_entries": 0,
+                "fetch_cooldown_entries": 1,
+                "fetch_blocked_entries": 0,
+                "too_short_entries": 0,
                 "summaries": 1,
                 "scores": 1,
                 "verifications": 1,
@@ -119,6 +129,11 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
                 "processed_telegram_updates": 2,
                 "daily_reports": 1,
             },
+            "llm_tokens_last_24h": {
+                "summary": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+                "score": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11},
+                "verify": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            },
             "recent_entries": [
                 {
                     "id": 1,
@@ -126,6 +141,10 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
                     "title": "Entry 1",
                     "status": "scored",
                     "quarantine_reason": None,
+                    "content_fetch_state": "ready",
+                    "content_fetch_fail_count": 0,
+                    "next_content_fetch_after": None,
+                    "last_content_fetch_error": None,
                     "verification_state": "not_required",
                     "verification_reason": "non_a",
                     "verified_at": None,
@@ -140,6 +159,9 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
                     "entry_id": 1,
                     "summary_confidence": 0.91,
                     "model": "deepseek-chat",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 20,
+                    "total_tokens": 30,
                     "created_at": "2026-03-16T10:03:00+00:00",
                 }
             ],
@@ -149,6 +171,9 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
                     "grade": "A",
                     "overall": 0.95,
                     "push_recommended": True,
+                    "prompt_tokens": 5,
+                    "completion_tokens": 6,
+                    "total_tokens": 11,
                     "created_at": "2026-03-16T10:04:00+00:00",
                 }
             ],
@@ -157,6 +182,9 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
                     "entry_id": 1,
                     "verdict": "verified",
                     "confidence": 0.9,
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
+                    "total_tokens": None,
                     "created_at": "2026-03-16T10:05:00+00:00",
                 }
             ],
@@ -201,12 +229,12 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
 
     with TestClient(main_module.app) as client:
         response = client.get(
-                "/internal/debug/overview",
-                headers={
-                    "x-internal-token": "internal",
-                    "x-admin-user-id": "1",
-                },
-            )
+            "/internal/debug/overview",
+            headers={
+                "x-internal-token": "internal",
+                "x-admin-user-id": "1",
+            },
+        )
 
     main_module.app.dependency_overrides.clear()
     body = response.json()
@@ -214,6 +242,7 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
     assert set(body) == {
         "generated_at",
         "counts",
+        "llm_tokens_last_24h",
         "recent_entries",
         "recent_summaries",
         "recent_scores",
@@ -223,10 +252,10 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
         "recent_processed_updates",
     }
     assert isinstance(body["generated_at"], str)
-    assert body["counts"]["quarantined_entries"] == 0
+    assert body["counts"]["fetch_cooldown_entries"] == 1
     assert body["counts"]["verification_not_required"] == 1
-    assert body["counts"]["processed_telegram_updates"] == 2
-    assert body["recent_entries"][0]["status"] == "scored"
+    assert body["llm_tokens_last_24h"]["summary"]["total_tokens"] == 30
+    assert body["recent_entries"][0]["content_fetch_state"] == "ready"
 
 
 class _FakeScalarResult:
@@ -238,8 +267,9 @@ class _FakeScalarResult:
 
 
 class _FakeExecuteResult:
-    def __init__(self, items: Sequence[object]) -> None:
-        self._items = items
+    def __init__(self, items: Sequence[object] | None = None, row: tuple[object, ...] | None = None) -> None:
+        self._items = list(items or [])
+        self._row = row
 
     def scalars(self) -> _FakeScalarResult:
         return _FakeScalarResult(self._items)
@@ -247,29 +277,47 @@ class _FakeExecuteResult:
     def all(self) -> Sequence[object]:
         return self._items
 
+    def one(self) -> tuple[object, ...]:
+        if self._row is None:
+            raise AssertionError("expected one() row")
+        return self._row
+
 
 class _FakeSession:
-    def __init__(self, counts: list[int], result_sets: Sequence[Sequence[object]]) -> None:
+    def __init__(self, counts: list[int], execute_results: Sequence[_FakeExecuteResult]) -> None:
         self._counts = iter(counts)
-        self._result_sets = iter(result_sets)
+        self._execute_results = iter(execute_results)
 
     async def scalar(self, _: object) -> int:
         return next(self._counts)
 
     async def execute(self, _: object) -> _FakeExecuteResult:
-        return _FakeExecuteResult(next(self._result_sets))
+        return next(self._execute_results)
 
 
 async def test_get_debug_overview_empty_snapshot() -> None:
     session = _FakeSession(
-        counts=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        result_sets=[[], [], [], [], [], [], []],
+        counts=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        execute_results=[
+            _FakeExecuteResult(row=(0, 0, 0)),
+            _FakeExecuteResult(row=(0, 0, 0)),
+            _FakeExecuteResult(row=(0, 0, 0)),
+            _FakeExecuteResult(items=[]),
+            _FakeExecuteResult(items=[]),
+            _FakeExecuteResult(items=[]),
+            _FakeExecuteResult(items=[]),
+            _FakeExecuteResult(items=[]),
+            _FakeExecuteResult(items=[]),
+            _FakeExecuteResult(items=[]),
+        ],
     )
 
     snapshot = await get_debug_overview(session)  # type: ignore[arg-type]
     dumped = snapshot.model_dump(mode="json")
 
     assert snapshot.counts.entries == 0
+    assert snapshot.counts.fetch_cooldown_entries == 0
+    assert snapshot.llm_tokens_last_24h.summary.total_tokens == 0
     assert snapshot.recent_entries == []
     assert snapshot.recent_scores == []
     assert snapshot.recent_push_events == []
@@ -285,6 +333,10 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
             title=f"Entry {index}",
             status=EntryStatus.SCORED,
             quarantine_reason=None,
+            content_fetch_state=ContentFetchState.READY,
+            content_fetch_fail_count=0,
+            next_content_fetch_after=None,
+            last_content_fetch_error=None,
             verification_state=None,
             verification_reason=None,
             verified_at=None,
@@ -300,6 +352,9 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
             entry_id=1,
             summary_confidence=0.88,
             model="deepseek-chat",
+            prompt_tokens=20,
+            completion_tokens=30,
+            total_tokens=50,
             created_at=base_time,
         )
     ]
@@ -309,6 +364,9 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
             grade=Grade.A,
             overall=0.93,
             push_recommended=True,
+            prompt_tokens=10,
+            completion_tokens=11,
+            total_tokens=21,
             created_at=base_time + timedelta(minutes=1),
         )
     ]
@@ -317,6 +375,9 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
             entry_id=1,
             verdict=VerificationVerdict.VERIFIED,
             confidence=0.84,
+            prompt_tokens=5,
+            completion_tokens=6,
+            total_tokens=11,
             created_at=base_time + timedelta(minutes=2),
         )
     ]
@@ -353,15 +414,18 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
         )
     ]
     session = _FakeSession(
-        counts=[6, 0, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1],
-        result_sets=[
-            entries,
-            summaries,
-            scores,
-            verifications,
-            verification_candidates,
-            push_events,
-            processed_updates,
+        counts=[6, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1],
+        execute_results=[
+            _FakeExecuteResult(row=(20, 30, 50)),
+            _FakeExecuteResult(row=(10, 11, 21)),
+            _FakeExecuteResult(row=(5, 6, 11)),
+            _FakeExecuteResult(items=entries),
+            _FakeExecuteResult(items=summaries),
+            _FakeExecuteResult(items=scores),
+            _FakeExecuteResult(items=verifications),
+            _FakeExecuteResult(items=verification_candidates),
+            _FakeExecuteResult(items=push_events),
+            _FakeExecuteResult(items=processed_updates),
         ],
     )
 
@@ -369,10 +433,12 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
     dumped = snapshot.model_dump(mode="json")
 
     assert snapshot.counts.entries == 6
-    assert snapshot.counts.quarantined_entries == 0
+    assert snapshot.counts.fetch_cooldown_entries == 1
+    assert snapshot.counts.too_short_entries == 1
     assert snapshot.counts.verification_not_required == 1
+    assert snapshot.llm_tokens_last_24h.summary.total_tokens == 50
     assert len(snapshot.recent_entries) == 5
-    assert snapshot.recent_entries[0].status == "scored"
+    assert snapshot.recent_entries[0].content_fetch_state == "ready"
     assert snapshot.recent_scores[0].grade == "A"
     assert snapshot.recent_verifications[0].verdict == "verified"
     assert snapshot.recent_verification_candidates[0].grade == "A"

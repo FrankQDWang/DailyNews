@@ -7,7 +7,14 @@ from sqlalchemy import Select, delete, func, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from libs.core.db.enums import EntryStatus, Grade, PushStatus, PushType, VerificationState
+from libs.core.db.enums import (
+    ContentFetchState,
+    EntryStatus,
+    Grade,
+    PushStatus,
+    PushType,
+    VerificationState,
+)
 from libs.core.db.models import (
     DailyReport,
     Entry,
@@ -20,15 +27,17 @@ from libs.core.db.models import (
 from libs.core.schemas.debug import (
     DebugCounts,
     DebugEntryRow,
+    DebugLlmTokensLast24h,
     DebugOverviewResponse,
     DebugProcessedUpdateRow,
     DebugPushEventRow,
     DebugScoreRow,
     DebugSummaryRow,
+    DebugTokenUsageRow,
     DebugVerificationCandidateRow,
     DebugVerificationRow,
 )
-from libs.core.schemas.llm import L0SummaryOutput, L1ScoreOutput, L2VerifyOutput
+from libs.core.schemas.llm import L0SummaryOutput, L1ScoreOutput, L2VerifyOutput, LLMUsage
 
 
 def _utc_now() -> datetime:
@@ -59,24 +68,115 @@ async def upsert_entry(
         content_html=content_html,
         content_text=content_text,
         status=EntryStatus.NEW,
+        content_fetch_state=ContentFetchState.READY,
+        content_fetch_fail_count=0,
     )
+    update_values: dict[str, object] = {
+        "miniflux_feed_id": miniflux_feed_id,
+        "url": url,
+        "title": title,
+        "author": author,
+        "published_at": published_at,
+        "updated_at": func.now(),
+    }
+    if fetched_at is not None:
+        update_values["fetched_at"] = fetched_at
+    if content_html is not None:
+        update_values["content_html"] = content_html
+    if content_text is not None:
+        update_values["content_text"] = content_text
     stmt = stmt.on_conflict_do_update(
         index_elements=[Entry.miniflux_entry_id],
-        set_={
-            "title": title,
-            "author": author,
-            "published_at": published_at,
-            "fetched_at": fetched_at,
-            "content_html": content_html,
-            "content_text": content_text,
-            "updated_at": func.now(),
-        },
+        set_=update_values,
     ).returning(Entry.id)
     entry_id = await session.scalar(stmt)
     await session.commit()
     if entry_id is None:
         raise RuntimeError("Failed to upsert entry")
     return int(entry_id)
+
+
+async def save_entry_content(
+    session: AsyncSession,
+    entry_id: int,
+    *,
+    content_html: str | None,
+    content_text: str | None,
+    fetched_at: datetime | None,
+) -> None:
+    await session.execute(
+        update(Entry)
+        .where(Entry.id == entry_id)
+        .values(
+            content_html=content_html,
+            content_text=content_text,
+            fetched_at=fetched_at,
+            content_fetch_state=ContentFetchState.READY,
+            content_fetch_fail_count=0,
+            last_content_fetch_at=fetched_at,
+            next_content_fetch_after=None,
+            last_content_fetch_error=None,
+            updated_at=func.now(),
+        )
+    )
+    await session.commit()
+
+
+def _content_fetch_backoff(fail_count: int) -> timedelta | None:
+    if fail_count == 1:
+        return timedelta(minutes=15)
+    if fail_count == 2:
+        return timedelta(hours=1)
+    if fail_count == 3:
+        return timedelta(hours=6)
+    if fail_count == 4:
+        return timedelta(hours=24)
+    return None
+
+
+async def record_content_fetch_failure(
+    session: AsyncSession,
+    entry_id: int,
+    *,
+    error: str,
+    at: datetime | None = None,
+) -> ContentFetchState:
+    entry = await session.get(Entry, entry_id)
+    if entry is None:
+        raise RuntimeError(f"Entry not found for fetch failure: {entry_id}")
+
+    current_time = at or _utc_now()
+    next_fail_count = int(entry.content_fetch_fail_count or 0) + 1
+    cooldown = _content_fetch_backoff(next_fail_count)
+    next_state = ContentFetchState.BLOCKED if cooldown is None else ContentFetchState.COOLDOWN
+    values: dict[str, object] = {
+        "content_fetch_state": next_state,
+        "content_fetch_fail_count": next_fail_count,
+        "last_content_fetch_at": current_time,
+        "last_content_fetch_error": error,
+        "updated_at": func.now(),
+    }
+    values["next_content_fetch_after"] = None if cooldown is None else current_time + cooldown
+    await session.execute(update(Entry).where(Entry.id == entry_id).values(**values))
+    await session.commit()
+    return next_state
+
+
+async def reset_content_fetch_state(session: AsyncSession, entry_id: int) -> None:
+    await session.execute(
+        update(Entry)
+        .where(Entry.id == entry_id)
+        .values(
+            content_fetch_state=ContentFetchState.READY,
+            content_fetch_fail_count=0,
+            last_content_fetch_at=None,
+            next_content_fetch_after=None,
+            last_content_fetch_error=None,
+            error=None,
+            updated_at=func.now(),
+        )
+    )
+    await session.commit()
 
 
 async def mark_entry_failed(session: AsyncSession, entry_id: int, error: str) -> None:
@@ -121,7 +221,13 @@ async def set_verification_state(
     await session.commit()
 
 
-async def save_summary(session: AsyncSession, entry_id: int, output: L0SummaryOutput, model: str) -> None:
+async def save_summary(
+    session: AsyncSession,
+    entry_id: int,
+    output: L0SummaryOutput,
+    model: str,
+    usage: LLMUsage | None = None,
+) -> None:
     stmt = pg_insert(Summary).values(
         entry_id=entry_id,
         tldr=output.tldr,
@@ -135,6 +241,9 @@ async def save_summary(session: AsyncSession, entry_id: int, output: L0SummaryOu
         summary_confidence=output.summary_confidence,
         summary_json=output.model_dump(),
         model=model,
+        prompt_tokens=usage.prompt_tokens if usage is not None else None,
+        completion_tokens=usage.completion_tokens if usage is not None else None,
+        total_tokens=usage.total_tokens if usage is not None else None,
     )
     stmt = stmt.on_conflict_do_update(
         index_elements=[Summary.entry_id],
@@ -150,6 +259,9 @@ async def save_summary(session: AsyncSession, entry_id: int, output: L0SummaryOu
             "summary_confidence": output.summary_confidence,
             "summary_json": output.model_dump(),
             "model": model,
+            "prompt_tokens": usage.prompt_tokens if usage is not None else None,
+            "completion_tokens": usage.completion_tokens if usage is not None else None,
+            "total_tokens": usage.total_tokens if usage is not None else None,
         },
     )
     await session.execute(stmt)
@@ -168,7 +280,13 @@ async def save_summary(session: AsyncSession, entry_id: int, output: L0SummaryOu
     await session.commit()
 
 
-async def save_score(session: AsyncSession, entry_id: int, output: L1ScoreOutput, model: str) -> None:
+async def save_score(
+    session: AsyncSession,
+    entry_id: int,
+    output: L1ScoreOutput,
+    model: str,
+    usage: LLMUsage | None = None,
+) -> None:
     stmt = pg_insert(Score).values(
         entry_id=entry_id,
         relevance_agents=output.relevance.agents,
@@ -184,6 +302,9 @@ async def save_score(session: AsyncSession, entry_id: int, output: L1ScoreOutput
         rationale=output.rationale,
         push_recommended=output.push_recommended,
         model=model,
+        prompt_tokens=usage.prompt_tokens if usage is not None else None,
+        completion_tokens=usage.completion_tokens if usage is not None else None,
+        total_tokens=usage.total_tokens if usage is not None else None,
     )
     stmt = stmt.on_conflict_do_update(
         index_elements=[Score.entry_id],
@@ -201,6 +322,9 @@ async def save_score(session: AsyncSession, entry_id: int, output: L1ScoreOutput
             "rationale": output.rationale,
             "push_recommended": output.push_recommended,
             "model": model,
+            "prompt_tokens": usage.prompt_tokens if usage is not None else None,
+            "completion_tokens": usage.completion_tokens if usage is not None else None,
+            "total_tokens": usage.total_tokens if usage is not None else None,
         },
     )
     await session.execute(stmt)
@@ -220,7 +344,11 @@ async def save_score(session: AsyncSession, entry_id: int, output: L1ScoreOutput
 
 
 async def save_verification(
-    session: AsyncSession, entry_id: int, output: L2VerifyOutput, model: str
+    session: AsyncSession,
+    entry_id: int,
+    output: L2VerifyOutput,
+    model: str,
+    usage: LLMUsage | None = None,
 ) -> None:
     stmt = pg_insert(Verification).values(
         entry_id=entry_id,
@@ -231,6 +359,9 @@ async def save_verification(
         notes=output.notes,
         confidence=output.confidence,
         model=model,
+        prompt_tokens=usage.prompt_tokens if usage is not None else None,
+        completion_tokens=usage.completion_tokens if usage is not None else None,
+        total_tokens=usage.total_tokens if usage is not None else None,
     )
     stmt = stmt.on_conflict_do_update(
         index_elements=[Verification.entry_id],
@@ -242,6 +373,9 @@ async def save_verification(
             "notes": output.notes,
             "confidence": output.confidence,
             "model": model,
+            "prompt_tokens": usage.prompt_tokens if usage is not None else None,
+            "completion_tokens": usage.completion_tokens if usage is not None else None,
+            "total_tokens": usage.total_tokens if usage is not None else None,
         },
     )
     await session.execute(stmt)
@@ -435,6 +569,42 @@ async def _count_entries_with_verification_state(
     return int(count or 0)
 
 
+async def _count_entries_with_fetch_state(
+    session: AsyncSession, state: ContentFetchState
+) -> int:
+    count = await session.scalar(
+        select(func.count()).select_from(Entry).where(Entry.content_fetch_state == state)
+    )
+    return int(count or 0)
+
+
+async def _count_entries_with_quarantine_reason(session: AsyncSession, reason: str) -> int:
+    count = await session.scalar(
+        select(func.count()).select_from(Entry).where(Entry.quarantine_reason == reason)
+    )
+    return int(count or 0)
+
+
+async def _token_usage_last_24h(
+    session: AsyncSession, model: type[Summary] | type[Score] | type[Verification]
+) -> DebugTokenUsageRow:
+    since = _utc_now() - timedelta(hours=24)
+    prompt_tokens, completion_tokens, total_tokens = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(model.prompt_tokens), 0),
+                func.coalesce(func.sum(model.completion_tokens), 0),
+                func.coalesce(func.sum(model.total_tokens), 0),
+            ).where(model.created_at >= since)
+        )
+    ).one()
+    return DebugTokenUsageRow(
+        prompt_tokens=int(prompt_tokens or 0),
+        completion_tokens=int(completion_tokens or 0),
+        total_tokens=int(total_tokens or 0),
+    )
+
+
 async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
     entry_count = await _count_rows(session, Entry)
     quarantined_count = int(
@@ -443,6 +613,9 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
         )
         or 0
     )
+    fetch_cooldown_count = await _count_entries_with_fetch_state(session, ContentFetchState.COOLDOWN)
+    fetch_blocked_count = await _count_entries_with_fetch_state(session, ContentFetchState.BLOCKED)
+    too_short_count = await _count_entries_with_quarantine_reason(session, "too_short_content")
     summary_count = await _count_rows(session, Summary)
     score_count = await _count_rows(session, Score)
     verification_count = await _count_rows(session, Verification)
@@ -461,6 +634,9 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
     push_event_count = await _count_rows(session, PushEvent)
     processed_update_count = await _count_rows(session, ProcessedTelegramUpdate)
     daily_report_count = await _count_rows(session, DailyReport)
+    summary_tokens_last_24h = await _token_usage_last_24h(session, Summary)
+    score_tokens_last_24h = await _token_usage_last_24h(session, Score)
+    verify_tokens_last_24h = await _token_usage_last_24h(session, Verification)
 
     entries_result = await session.execute(select(Entry).order_by(Entry.created_at.desc()).limit(5))
     summaries_result = await session.execute(select(Summary).order_by(Summary.created_at.desc()).limit(5))
@@ -489,6 +665,10 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
             title=str(entry.title),
             status=_enum_to_value(entry.status),
             quarantine_reason=entry.quarantine_reason,
+            content_fetch_state=_enum_to_value(entry.content_fetch_state),
+            content_fetch_fail_count=int(entry.content_fetch_fail_count),
+            next_content_fetch_after=entry.next_content_fetch_after,
+            last_content_fetch_error=entry.last_content_fetch_error,
             verification_state=(
                 _enum_to_value(entry.verification_state) if entry.verification_state is not None else None
             ),
@@ -506,6 +686,9 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
             entry_id=int(summary.entry_id),
             summary_confidence=float(summary.summary_confidence),
             model=str(summary.model),
+            prompt_tokens=summary.prompt_tokens,
+            completion_tokens=summary.completion_tokens,
+            total_tokens=summary.total_tokens,
             created_at=summary.created_at,
         )
         for summary in list(summaries_result.scalars().all())[:5]
@@ -516,6 +699,9 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
             grade=_enum_to_value(score.grade),
             overall=float(score.overall),
             push_recommended=bool(score.push_recommended),
+            prompt_tokens=score.prompt_tokens,
+            completion_tokens=score.completion_tokens,
+            total_tokens=score.total_tokens,
             created_at=score.created_at,
         )
         for score in list(scores_result.scalars().all())[:5]
@@ -525,6 +711,9 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
             entry_id=int(verification.entry_id),
             verdict=_enum_to_value(verification.verdict),
             confidence=float(verification.confidence),
+            prompt_tokens=verification.prompt_tokens,
+            completion_tokens=verification.completion_tokens,
+            total_tokens=verification.total_tokens,
             created_at=verification.created_at,
         )
         for verification in list(verifications_result.scalars().all())[:5]
@@ -569,6 +758,9 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
         counts=DebugCounts(
             entries=entry_count,
             quarantined_entries=quarantined_count,
+            fetch_cooldown_entries=fetch_cooldown_count,
+            fetch_blocked_entries=fetch_blocked_count,
+            too_short_entries=too_short_count,
             summaries=summary_count,
             scores=score_count,
             verifications=verification_count,
@@ -579,6 +771,11 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
             push_events=push_event_count,
             processed_telegram_updates=processed_update_count,
             daily_reports=daily_report_count,
+        ),
+        llm_tokens_last_24h=DebugLlmTokensLast24h(
+            summary=summary_tokens_last_24h,
+            score=score_tokens_last_24h,
+            verify=verify_tokens_last_24h,
         ),
         recent_entries=recent_entries,
         recent_summaries=recent_summaries,

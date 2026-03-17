@@ -9,7 +9,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from temporalio.client import Client as TemporalClient
 
 from apps.api.dependencies import require_internal_admin
-from libs.core.db.repositories import get_debug_overview, mark_telegram_update_processed
+from libs.core.db.repositories import (
+    get_debug_overview,
+    mark_telegram_update_processed,
+    reset_content_fetch_state,
+)
 from libs.core.db.session import get_session
 from libs.core.logging import configure_logging
 from libs.core.metrics import TASKS_TOTAL
@@ -72,8 +76,10 @@ def create_app() -> FastAPI:
     async def internal_reprocess(
         entry_id: int,
         _: int = Depends(require_internal_admin),
+        db: AsyncSession = Depends(get_session),
         settings: Settings = Depends(get_settings),
     ) -> dict[str, str]:
+        await reset_content_fetch_state(db, entry_id)
         client = await TemporalClient.connect(settings.temporal_host, namespace=settings.temporal_namespace)
         workflow_id = f"manual-reprocess-{entry_id}"
         await client.start_workflow(

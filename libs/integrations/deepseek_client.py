@@ -7,8 +7,14 @@ from typing import Any, TypeVar
 import httpx
 from pydantic import BaseModel
 
-from libs.core.metrics import LLM_ERRORS_TOTAL, LLM_RETRY_TOTAL
-from libs.core.schemas.llm import ChatOutput, L0SummaryOutput, L1ScoreOutput, L2VerifyOutput
+from libs.core.metrics import LLM_CALLS_TOTAL, LLM_ERRORS_TOTAL, LLM_RETRY_TOTAL, LLM_TOKENS_TOTAL
+from libs.core.schemas.llm import (
+    ChatOutput,
+    L0SummaryOutput,
+    L1ScoreOutput,
+    L2VerifyOutput,
+    LLMUsage,
+)
 from libs.core.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -31,7 +37,9 @@ class DeepSeekClient:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def summarize(self, title: str, url: str, content_text: str) -> L0SummaryOutput:
+    async def summarize(
+        self, title: str, url: str, content_text: str
+    ) -> tuple[L0SummaryOutput, LLMUsage | None]:
         system = (
             "You are a structured summarizer. Output strict JSON only. "
             "Use Chinese as primary language and keep technical terms in English."
@@ -41,9 +49,17 @@ class DeepSeekClient:
             "entities,claims,risk_flags,reading_time_min,summary_confidence. "
             f"Title: {title}\nURL: {url}\nContent:\n{content_text[:12000]}"
         )
-        return await self._chat_json(self._settings.llm_model_summary, system, prompt, L0SummaryOutput)
+        return await self._chat_json(
+            self._settings.llm_model_summary,
+            system,
+            prompt,
+            L0SummaryOutput,
+            task="summary",
+        )
 
-    async def score(self, title: str, url: str, summary_json: dict[str, Any]) -> L1ScoreOutput:
+    async def score(
+        self, title: str, url: str, summary_json: dict[str, Any]
+    ) -> tuple[L1ScoreOutput, LLMUsage | None]:
         system = "You are an article scorer. Output strict JSON only."
         prompt = (
             "Score with relevance(agents,eval,product,engineering,biz), novelty, actionability, credibility,"
@@ -53,7 +69,13 @@ class DeepSeekClient:
             "actionability 0.04, credibility 0.02. "
             f"Title: {title}\nURL: {url}\nSummary: {json.dumps(summary_json, ensure_ascii=False)}"
         )
-        return await self._chat_json(self._settings.llm_model_score, system, prompt, L1ScoreOutput)
+        return await self._chat_json(
+            self._settings.llm_model_score,
+            system,
+            prompt,
+            L1ScoreOutput,
+            task="score",
+        )
 
     async def verify(
         self,
@@ -63,7 +85,7 @@ class DeepSeekClient:
         summary_json: dict[str, Any],
         citations: list[dict[str, str]],
         fallback_evidence: list[dict[str, str]],
-    ) -> L2VerifyOutput:
+    ) -> tuple[L2VerifyOutput, LLMUsage | None]:
         system = (
             "You are a strict verifier. Prefer first-hand evidence. Output strict JSON only. "
             "Keep snippets short and avoid long quotes."
@@ -76,7 +98,13 @@ class DeepSeekClient:
             f"\nSummary: {json.dumps(summary_json, ensure_ascii=False)}"
             f"\nContent: {content_text[:12000]}"
         )
-        return await self._chat_json(self._settings.llm_model_verify, system, prompt, L2VerifyOutput)
+        return await self._chat_json(
+            self._settings.llm_model_verify,
+            system,
+            prompt,
+            L2VerifyOutput,
+            task="verify",
+        )
 
     async def chat_answer(self, question: str, context_items: list[dict[str, Any]]) -> ChatOutput:
         system = "You are a Telegram research assistant. Output strict JSON only."
@@ -84,7 +112,14 @@ class DeepSeekClient:
             "Answer user's question using the context. Must provide answer, sources, followups."
             f"\nQuestion: {question}\nContext: {json.dumps(context_items, ensure_ascii=False)}"
         )
-        return await self._chat_json(self._settings.llm_model_chat, system, prompt, ChatOutput)
+        output, _ = await self._chat_json(
+            self._settings.llm_model_chat,
+            system,
+            prompt,
+            ChatOutput,
+            task="chat",
+        )
+        return output
 
     async def _chat_json(
         self,
@@ -92,7 +127,9 @@ class DeepSeekClient:
         system: str,
         prompt: str,
         schema: type[SchemaT],
-    ) -> SchemaT:
+        *,
+        task: str,
+    ) -> tuple[SchemaT, LLMUsage | None]:
         payload = {
             "model": model,
             "messages": [
@@ -105,12 +142,21 @@ class DeepSeekClient:
         last_error: Exception | None = None
         for attempt in range(1, 4):
             try:
+                LLM_CALLS_TOTAL.labels(task=task).inc()
                 resp = await self._client.post("/chat/completions", json=payload)
                 resp.raise_for_status()
-                content = resp.json()["choices"][0]["message"]["content"]
+                raw = resp.json()
+                content = raw["choices"][0]["message"]["content"]
                 data = _extract_json(content)
                 data = _coerce_schema_payload(schema, data)
-                return schema.model_validate(data)
+                usage = _parse_usage(raw.get("usage"))
+                if usage is not None:
+                    LLM_TOKENS_TOTAL.labels(task=task, kind="prompt").inc(usage.prompt_tokens)
+                    LLM_TOKENS_TOTAL.labels(task=task, kind="completion").inc(
+                        usage.completion_tokens
+                    )
+                    LLM_TOKENS_TOTAL.labels(task=task, kind="total").inc(usage.total_tokens)
+                return schema.model_validate(data), usage
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 LLM_ERRORS_TOTAL.inc()
@@ -163,6 +209,23 @@ def _coerce_l0_summary_payload(data: dict[str, Any]) -> dict[str, Any]:
     payload["language"] = str(payload.get("language") or "zh")
     payload["tldr"] = str(payload.get("tldr") or "")
     return payload
+
+
+def _parse_usage(raw: Any) -> LLMUsage | None:
+    if not isinstance(raw, dict):
+        return None
+    prompt_tokens = raw.get("prompt_tokens")
+    completion_tokens = raw.get("completion_tokens")
+    total_tokens = raw.get("total_tokens")
+    if not isinstance(prompt_tokens, int) or not isinstance(completion_tokens, int) or not isinstance(
+        total_tokens, int
+    ):
+        return None
+    return LLMUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
 
 
 def _coerce_key_points(value: Any) -> list[dict[str, Any]]:

@@ -13,6 +13,12 @@ class EntryStatus(str, Enum):
     FAILED = "failed"
 
 
+class ContentFetchState(str, Enum):
+    READY = "ready"
+    COOLDOWN = "cooldown"
+    BLOCKED = "blocked"
+
+
 class Grade(str, Enum):
     A = "A"
     B = "B"

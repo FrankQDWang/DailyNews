@@ -7,6 +7,7 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
+    from libs.core.settings import get_settings
     from libs.workflows.activities import (
         build_digest_activity,
         deepdive_activity,
@@ -24,9 +25,12 @@ with workflow.unsafe.imports_passed_through():
     from libs.workflows.contracts import (
         ingest_result_entry_id,
         ingest_result_needs_processing,
+        ingest_result_should_mark_read,
         push_decision_is_eligible,
         push_decision_reason,
     )
+
+settings = get_settings()
 
 
 @workflow.defn
@@ -40,12 +44,13 @@ class IngestBatchWorkflow:
         )
         raw_entries = await workflow.execute_activity(
             list_unread_miniflux_activity,
-            100,
+            settings.miniflux_scan_limit,
             start_to_close_timeout=timedelta(minutes=3),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
 
         entry_ids: list[int] = []
+        actionable_started = 0
         for row in raw_entries:
             ingest_result = await workflow.execute_activity(
                 fetch_and_upsert_entry_activity,
@@ -56,13 +61,17 @@ class IngestBatchWorkflow:
             entry_id = ingest_result_entry_id(ingest_result)
             entry_ids.append(entry_id)
             if not ingest_result_needs_processing(ingest_result):
-                await workflow.execute_activity(
-                    mark_entry_read_activity,
-                    entry_id,
-                    start_to_close_timeout=timedelta(minutes=2),
-                    retry_policy=RetryPolicy(maximum_attempts=1),
-                )
+                if ingest_result_should_mark_read(ingest_result):
+                    await workflow.execute_activity(
+                        mark_entry_read_activity,
+                        entry_id,
+                        start_to_close_timeout=timedelta(minutes=2),
+                        retry_policy=RetryPolicy(maximum_attempts=1),
+                    )
                 continue
+            if actionable_started >= settings.ingest_actionable_limit:
+                continue
+            actionable_started += 1
             await workflow.start_child_workflow(
                 ProcessEntryWorkflow.run,
                 entry_id,

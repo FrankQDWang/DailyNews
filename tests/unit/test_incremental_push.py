@@ -7,11 +7,16 @@ from types import SimpleNamespace
 from typing import Any
 
 import httpx
+from temporalio.exceptions import ApplicationError
 
-from libs.core.db.enums import EntryStatus, Grade, VerificationState
+from libs.core.db.enums import ContentFetchState, EntryStatus, Grade, VerificationState
 from libs.core.settings import Settings, get_settings
 from libs.integrations.miniflux_client import MinifluxClient, MinifluxEntry, MinifluxEntryPayload
-from libs.workflows.contracts import ingest_result_entry_id, ingest_result_needs_processing
+from libs.workflows.contracts import (
+    ingest_result_entry_id,
+    ingest_result_needs_processing,
+    ingest_result_should_mark_read,
+)
 
 
 def _base_env() -> dict[str, str]:
@@ -50,11 +55,15 @@ class _FakeExecuteResult:
 
 
 class _FakeSession:
-    def __init__(self, pushed_today: int = 0) -> None:
+    def __init__(self, pushed_today: int = 0, summary: object | None = None) -> None:
         self._pushed_today = pushed_today
+        self._summary = summary
 
     async def execute(self, _: object) -> _FakeExecuteResult:
         return _FakeExecuteResult([object()] * self._pushed_today)
+
+    async def scalar(self, _: object) -> object | None:
+        return self._summary
 
 
 def _load_activities_module(monkeypatch: Any) -> Any:
@@ -98,7 +107,214 @@ async def test_miniflux_mark_entries_read_uses_bulk_endpoint() -> None:
     }
 
 
-async def test_fetch_and_upsert_entry_activity_returns_terminal_entry_contract(monkeypatch: Any) -> None:
+async def test_fetch_and_upsert_entry_activity_skips_fetch_for_terminal_status(monkeypatch: Any) -> None:
+    activities = _load_activities_module(monkeypatch)
+    payload: MinifluxEntryPayload = {
+        "id": 123,
+        "feed_id": 9,
+        "title": "Entry",
+        "url": "https://example.com/post",
+        "author": "Tester",
+        "published_at": "2026-03-17T00:00:00+00:00",
+        "content": "body",
+    }
+
+    class _FailIfFetchedClient:
+        async def fetch_content(self, _: int) -> MinifluxEntry:
+            raise AssertionError("fetch_content should not be called")
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_upsert_entry(_: object, **__: object) -> int:
+        return 42
+
+    async def fake_get_entry_for_processing(_: object, __: int) -> object:
+        return SimpleNamespace(
+            id=42,
+            miniflux_entry_id=123,
+            published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
+            status=EntryStatus.SCORED,
+            content_fetch_state=ContentFetchState.READY,
+            next_content_fetch_after=None,
+        )
+
+    monkeypatch.setattr(activities, "MinifluxClient", lambda _: _FailIfFetchedClient())
+    monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(object()))
+    monkeypatch.setattr(activities, "upsert_entry", fake_upsert_entry)
+    monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
+
+    result = await activities.fetch_and_upsert_entry_activity(payload)
+
+    assert result == {
+        "entry_id": 42,
+        "miniflux_entry_id": 123,
+        "published_at": "2026-03-17T00:00:00+00:00",
+        "current_status": "scored",
+        "needs_processing": False,
+        "should_mark_read": True,
+    }
+
+
+async def test_fetch_and_upsert_entry_activity_respects_cooldown(monkeypatch: Any) -> None:
+    activities = _load_activities_module(monkeypatch)
+    payload: MinifluxEntryPayload = {
+        "id": 123,
+        "feed_id": 9,
+        "title": "Entry",
+        "url": "https://example.com/post",
+        "author": "Tester",
+        "published_at": "2026-03-17T00:00:00+00:00",
+        "content": "body",
+    }
+
+    class _FailIfFetchedClient:
+        async def fetch_content(self, _: int) -> MinifluxEntry:
+            raise AssertionError("fetch_content should not be called during cooldown")
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_upsert_entry(_: object, **__: object) -> int:
+        return 42
+
+    async def fake_get_entry_for_processing(_: object, __: int) -> object:
+        return SimpleNamespace(
+            id=42,
+            miniflux_entry_id=123,
+            published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
+            status=EntryStatus.FAILED,
+            content_fetch_state=ContentFetchState.COOLDOWN,
+            next_content_fetch_after=datetime.now(UTC) + timedelta(minutes=10),
+        )
+
+    monkeypatch.setattr(activities, "MinifluxClient", lambda _: _FailIfFetchedClient())
+    monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(object()))
+    monkeypatch.setattr(activities, "upsert_entry", fake_upsert_entry)
+    monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
+
+    result = await activities.fetch_and_upsert_entry_activity(payload)
+
+    assert result["needs_processing"] is False
+    assert result["should_mark_read"] is False
+    assert result["current_status"] == "failed"
+
+
+async def test_fetch_and_upsert_entry_activity_marks_blocked_entries_for_read_sync(monkeypatch: Any) -> None:
+    activities = _load_activities_module(monkeypatch)
+    payload: MinifluxEntryPayload = {
+        "id": 123,
+        "feed_id": 9,
+        "title": "Entry",
+        "url": "https://example.com/post",
+        "author": "Tester",
+        "published_at": "2026-03-17T00:00:00+00:00",
+        "content": "body",
+    }
+
+    class _FailIfFetchedClient:
+        async def fetch_content(self, _: int) -> MinifluxEntry:
+            raise AssertionError("fetch_content should not be called for blocked entries")
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_upsert_entry(_: object, **__: object) -> int:
+        return 42
+
+    async def fake_get_entry_for_processing(_: object, __: int) -> object:
+        return SimpleNamespace(
+            id=42,
+            miniflux_entry_id=123,
+            published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
+            status=EntryStatus.FAILED,
+            content_fetch_state=ContentFetchState.BLOCKED,
+            next_content_fetch_after=None,
+        )
+
+    monkeypatch.setattr(activities, "MinifluxClient", lambda _: _FailIfFetchedClient())
+    monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(object()))
+    monkeypatch.setattr(activities, "upsert_entry", fake_upsert_entry)
+    monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
+
+    result = await activities.fetch_and_upsert_entry_activity(payload)
+
+    assert result["needs_processing"] is False
+    assert result["should_mark_read"] is True
+
+
+async def test_fetch_and_upsert_entry_activity_records_retryable_failure_and_blocks(monkeypatch: Any) -> None:
+    activities = _load_activities_module(monkeypatch)
+    payload: MinifluxEntryPayload = {
+        "id": 123,
+        "feed_id": 9,
+        "title": "Entry",
+        "url": "https://example.com/post",
+        "author": "Tester",
+        "published_at": "2026-03-17T00:00:00+00:00",
+        "content": "body",
+    }
+    states = [
+        SimpleNamespace(
+            id=42,
+            miniflux_entry_id=123,
+            published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
+            status=EntryStatus.FAILED,
+            content_fetch_state=ContentFetchState.READY,
+            next_content_fetch_after=None,
+        ),
+        SimpleNamespace(
+            id=42,
+            miniflux_entry_id=123,
+            published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
+            status=EntryStatus.FAILED,
+            content_fetch_state=ContentFetchState.BLOCKED,
+            next_content_fetch_after=None,
+        ),
+    ]
+    recorded: list[tuple[int, str]] = []
+
+    request = httpx.Request("GET", "https://example.com/v1/entries/123/fetch-content")
+    response = httpx.Response(status_code=429, request=request)
+
+    class _FailingMinifluxClient:
+        async def fetch_content(self, _: int) -> MinifluxEntry:
+            raise httpx.HTTPStatusError("too many requests", request=request, response=response)
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_upsert_entry(_: object, **__: object) -> int:
+        return 42
+
+    async def fake_get_entry_for_processing(_: object, __: int) -> object:
+        return states.pop(0)
+
+    async def fake_record_content_fetch_failure(
+        _: object,
+        entry_id: int,
+        *,
+        error: str,
+        at: datetime | None = None,
+    ) -> ContentFetchState:
+        del at
+        recorded.append((entry_id, error))
+        return ContentFetchState.BLOCKED
+
+    monkeypatch.setattr(activities, "MinifluxClient", lambda _: _FailingMinifluxClient())
+    monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(object()))
+    monkeypatch.setattr(activities, "upsert_entry", fake_upsert_entry)
+    monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
+    monkeypatch.setattr(activities, "record_content_fetch_failure", fake_record_content_fetch_failure)
+
+    result = await activities.fetch_and_upsert_entry_activity(payload)
+
+    assert recorded == [(42, "http_status:429")]
+    assert result["needs_processing"] is False
+    assert result["should_mark_read"] is True
+
+
+async def test_fetch_and_upsert_entry_activity_quarantines_too_short_content(monkeypatch: Any) -> None:
     activities = _load_activities_module(monkeypatch)
     payload: MinifluxEntryPayload = {
         "id": 123,
@@ -116,94 +332,52 @@ async def test_fetch_and_upsert_entry_activity_returns_terminal_entry_contract(m
         url="https://example.com/post",
         author="Tester",
         published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
-        content="body",
+        content="short text",
     )
-
-    class _FakeMinifluxClient:
-        async def fetch_content(self, _: int) -> MinifluxEntry:
-            return fetched_entry
-
-        async def close(self) -> None:
-            return None
-
-    async def fake_upsert_entry(_: object, **__: object) -> int:
-        return 42
-
-    async def fake_get_entry_for_processing(_: object, __: int) -> object:
-        return SimpleNamespace(
-            id=42,
-            miniflux_entry_id=123,
-            published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
-            status=EntryStatus.SCORED,
-        )
-
-    monkeypatch.setattr(activities, "MinifluxClient", lambda _: _FakeMinifluxClient())
-    monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(object()))
-    monkeypatch.setattr(activities, "upsert_entry", fake_upsert_entry)
-    monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
-
-    result = await activities.fetch_and_upsert_entry_activity(payload)
-
-    assert result == {
-        "entry_id": 42,
-        "miniflux_entry_id": 123,
-        "published_at": "2026-03-17T00:00:00+00:00",
-        "current_status": "scored",
-        "needs_processing": False,
-    }
-
-
-async def test_fetch_and_upsert_entry_activity_quarantines_empty_content(monkeypatch: Any) -> None:
-    activities = _load_activities_module(monkeypatch)
-    payload: MinifluxEntryPayload = {
-        "id": 123,
-        "feed_id": 9,
-        "title": "Entry",
-        "url": "https://example.com/post",
-        "author": "Tester",
-        "published_at": "2026-03-17T00:00:00+00:00",
-        "content": "<p></p>",
-    }
-    fetched_entry = MinifluxEntry(
-        id=123,
-        feed_id=9,
-        title="Entry",
-        url="https://example.com/post",
-        author="Tester",
-        published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
-        content="<p></p>",
-    )
-
-    class _FakeMinifluxClient:
-        async def fetch_content(self, _: int) -> MinifluxEntry:
-            return fetched_entry
-
-        async def close(self) -> None:
-            return None
-
-    entry_states = [
+    states = [
         SimpleNamespace(
             id=42,
             miniflux_entry_id=123,
             published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
-            status=EntryStatus.FAILED,
-            quarantine_reason=None,
+            status=EntryStatus.NEW,
+            content_fetch_state=ContentFetchState.READY,
+            next_content_fetch_after=None,
+        ),
+        SimpleNamespace(
+            id=42,
+            miniflux_entry_id=123,
+            published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
+            status=EntryStatus.NEW,
+            content_fetch_state=ContentFetchState.READY,
+            next_content_fetch_after=None,
         ),
         SimpleNamespace(
             id=42,
             miniflux_entry_id=123,
             published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
             status=EntryStatus.QUARANTINED,
-            quarantine_reason="empty_content",
+            quarantine_reason="too_short_content",
+            content_fetch_state=ContentFetchState.READY,
+            next_content_fetch_after=None,
         ),
     ]
     quarantined: list[tuple[int, str]] = []
+
+    class _FakeMinifluxClient:
+        async def fetch_content(self, _: int) -> MinifluxEntry:
+            return fetched_entry
+
+        async def close(self) -> None:
+            return None
 
     async def fake_upsert_entry(_: object, **__: object) -> int:
         return 42
 
     async def fake_get_entry_for_processing(_: object, __: int) -> object:
-        return entry_states.pop(0)
+        return states.pop(0)
+
+    async def fake_save_entry_content(_: object, __: int, **___: object) -> None:
+        return None
 
     async def fake_quarantine_entry(_: object, entry_id: int, reason: str) -> None:
         quarantined.append((entry_id, reason))
@@ -212,24 +386,22 @@ async def test_fetch_and_upsert_entry_activity_quarantines_empty_content(monkeyp
     monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(object()))
     monkeypatch.setattr(activities, "upsert_entry", fake_upsert_entry)
     monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
+    monkeypatch.setattr(activities, "save_entry_content", fake_save_entry_content)
     monkeypatch.setattr(activities, "quarantine_entry", fake_quarantine_entry)
 
     result = await activities.fetch_and_upsert_entry_activity(payload)
 
-    assert quarantined == [(42, "empty_content")]
-    assert result == {
-        "entry_id": 42,
-        "miniflux_entry_id": 123,
-        "published_at": "2026-03-17T00:00:00+00:00",
-        "current_status": "quarantined",
-        "needs_processing": False,
-    }
+    assert quarantined == [(42, "too_short_content")]
+    assert result["needs_processing"] is False
+    assert result["should_mark_read"] is True
+    assert result["current_status"] == "quarantined"
 
 
-def test_empty_content_normalization_handles_blank_html(monkeypatch: Any) -> None:
+def test_content_normalization_handles_blank_and_short_html(monkeypatch: Any) -> None:
     activities = _load_activities_module(monkeypatch)
     assert activities._is_empty_content("<p>&nbsp;</p>\u200b")
-    assert not activities._is_empty_content("<p>Hello</p>")
+    assert activities._is_too_short_content("<p>short text</p>")
+    assert not activities._is_too_short_content("<p>" + ("long " * 100) + "</p>")
 
 
 async def test_should_push_activity_rejects_historical_entries(monkeypatch: Any) -> None:
@@ -419,15 +591,50 @@ async def test_mark_entry_read_activity_returns_false_when_miniflux_fails(monkey
     assert await activities.mark_entry_read_activity(7) is False
 
 
-async def test_summarize_entry_activity_quarantines_empty_content(monkeypatch: Any) -> None:
+async def test_summarize_entry_activity_returns_cached_summary(monkeypatch: Any) -> None:
     activities = _load_activities_module(monkeypatch)
-    session = object()
-    entry = SimpleNamespace(id=7, miniflux_entry_id=701, content_text="<p></p>")
+    entry = SimpleNamespace(id=7, miniflux_entry_id=701, content_text="body")
+    cached_summary = SimpleNamespace(summary_json={"tldr": "cached"})
+
+    class _FailingDeepSeekClient:
+        async def summarize(self, *_: object, **__: object) -> object:
+            raise AssertionError("DeepSeek should not be called when summary exists")
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_get_entry_for_processing(_: object, __: int) -> object:
+        return entry
+
+    async def fake_get_summary(_: object, __: int) -> object:
+        return cached_summary
+
+    monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(_FakeSession()))
+    monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
+    monkeypatch.setattr(activities, "get_summary", fake_get_summary)
+    monkeypatch.setattr(activities, "DeepSeekClient", lambda _: _FailingDeepSeekClient())
+
+    assert await activities.summarize_entry_activity(7) == {"tldr": "cached"}
+
+
+async def test_summarize_entry_activity_quarantines_too_short_content(monkeypatch: Any) -> None:
+    activities = _load_activities_module(monkeypatch)
+    session = _FakeSession(summary=None)
+    entry = SimpleNamespace(
+        id=7,
+        miniflux_entry_id=701,
+        content_text="short text",
+        content_fetch_state=ContentFetchState.READY,
+        next_content_fetch_after=None,
+    )
     quarantined: list[tuple[int, str]] = []
     read_sync_calls: list[tuple[int, bool]] = []
 
     async def fake_get_entry_for_processing(_: object, __: int) -> object:
         return entry
+
+    async def fake_get_summary(_: object, __: int) -> None:
+        return None
 
     async def fake_quarantine_entry(_: object, entry_id: int, reason: str) -> None:
         quarantined.append((entry_id, reason))
@@ -438,17 +645,18 @@ async def test_summarize_entry_activity_quarantines_empty_content(monkeypatch: A
 
     monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(session))
     monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
+    monkeypatch.setattr(activities, "get_summary", fake_get_summary)
     monkeypatch.setattr(activities, "quarantine_entry", fake_quarantine_entry)
     monkeypatch.setattr(activities, "_sync_miniflux_read_for_entry", fake_sync_miniflux_read_for_entry)
 
     try:
         await activities.summarize_entry_activity(7)
-    except RuntimeError as exc:
-        assert "quarantined due to empty content" in str(exc)
+    except ApplicationError as exc:
+        assert "too-short content" in str(exc)
     else:
-        raise AssertionError("expected summarize_entry_activity to raise for empty content")
+        raise AssertionError("expected summarize_entry_activity to raise for too-short content")
 
-    assert quarantined == [(7, "empty_content")]
+    assert quarantined == [(7, "too_short_content")]
     assert read_sync_calls == [(7, True)]
 
 
@@ -515,3 +723,4 @@ async def test_verify_entry_activity_marks_verification_failed_without_entry_fai
 def test_ingest_result_helpers_accept_legacy_int_payload() -> None:
     assert ingest_result_entry_id(42) == 42
     assert ingest_result_needs_processing(42) is True
+    assert ingest_result_should_mark_read(42) is False

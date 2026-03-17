@@ -8,6 +8,9 @@ from pydantic import BaseModel
 class DebugCounts(BaseModel):
     entries: int
     quarantined_entries: int
+    fetch_cooldown_entries: int
+    fetch_blocked_entries: int
+    too_short_entries: int
     summaries: int
     scores: int
     verifications: int
@@ -26,6 +29,10 @@ class DebugEntryRow(BaseModel):
     title: str
     status: str
     quarantine_reason: str | None
+    content_fetch_state: str
+    content_fetch_fail_count: int
+    next_content_fetch_after: datetime | None
+    last_content_fetch_error: str | None
     verification_state: str | None
     verification_reason: str | None
     verified_at: datetime | None
@@ -39,6 +46,9 @@ class DebugSummaryRow(BaseModel):
     entry_id: int
     summary_confidence: float
     model: str
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
     created_at: datetime
 
 
@@ -47,6 +57,9 @@ class DebugScoreRow(BaseModel):
     grade: str
     overall: float
     push_recommended: bool
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
     created_at: datetime
 
 
@@ -54,6 +67,9 @@ class DebugVerificationRow(BaseModel):
     entry_id: int
     verdict: str
     confidence: float
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
     created_at: datetime
 
 
@@ -81,9 +97,22 @@ class DebugProcessedUpdateRow(BaseModel):
     created_at: datetime
 
 
+class DebugTokenUsageRow(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class DebugLlmTokensLast24h(BaseModel):
+    summary: DebugTokenUsageRow
+    score: DebugTokenUsageRow
+    verify: DebugTokenUsageRow
+
+
 class DebugOverviewResponse(BaseModel):
     generated_at: datetime
     counts: DebugCounts
+    llm_tokens_last_24h: DebugLlmTokensLast24h
     recent_entries: list[DebugEntryRow]
     recent_summaries: list[DebugSummaryRow]
     recent_scores: list[DebugScoreRow]

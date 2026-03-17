@@ -10,6 +10,7 @@ class IngestEntryResult(TypedDict):
     published_at: str | None
     current_status: str
     needs_processing: bool
+    should_mark_read: bool
 
 
 type IngestActivityPayloadValue = str | int | bool | None
@@ -35,6 +36,12 @@ def ingest_result_needs_processing(result: IngestActivityResult) -> bool:
     if isinstance(result, int):
         return True
     return bool(result["needs_processing"])
+
+
+def ingest_result_should_mark_read(result: IngestActivityResult) -> bool:
+    if isinstance(result, int):
+        return False
+    return bool(result.get("should_mark_read", False))
 
 
 def is_ingest_result_mapping(value: object) -> bool:
