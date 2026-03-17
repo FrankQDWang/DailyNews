@@ -121,6 +121,10 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
                 "summaries": 1,
                 "scores": 1,
                 "verifications": 1,
+                "process_completed_entries": 1,
+                "process_quarantined_entries": 0,
+                "process_fetch_deferred_entries": 0,
+                "process_failed_entries": 0,
                 "verification_pending": 0,
                 "verification_failed": 0,
                 "verification_not_required": 1,
@@ -154,6 +158,9 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
                     "content_fetch_fail_count": 0,
                     "next_content_fetch_after": None,
                     "last_content_fetch_error": None,
+                    "last_process_outcome": "completed",
+                    "last_process_reason": "pushed",
+                    "last_processed_at": "2026-03-16T10:02:30+00:00",
                     "verification_state": "not_required",
                     "verification_reason": "non_a",
                     "verified_at": None,
@@ -263,10 +270,12 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
     }
     assert isinstance(body["generated_at"], str)
     assert body["counts"]["fetch_cooldown_entries"] == 1
+    assert body["counts"]["process_completed_entries"] == 1
     assert body["counts"]["verification_not_required"] == 1
     assert body["llm_tokens_last_24h"]["summary"]["total_tokens"] == 30
     assert body["latest_ingest_batch"]["actionable_count"] == 30
     assert body["recent_entries"][0]["content_fetch_state"] == "ready"
+    assert body["recent_entries"][0]["last_process_outcome"] == "completed"
 
 
 class _FakeScalarResult:
@@ -308,7 +317,7 @@ class _FakeSession:
 
 async def test_get_debug_overview_empty_snapshot() -> None:
     session = _FakeSession(
-        counts=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None],
+        counts=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None],
         execute_results=[
             _FakeExecuteResult(row=(0, 0, 0)),
             _FakeExecuteResult(row=(0, 0, 0)),
@@ -349,6 +358,9 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
             content_fetch_fail_count=0,
             next_content_fetch_after=None,
             last_content_fetch_error=None,
+            last_process_outcome="completed",
+            last_process_reason="pushed",
+            last_processed_at=base_time - timedelta(minutes=index - 1),
             verification_state=None,
             verification_reason=None,
             verified_at=None,
@@ -435,7 +447,7 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
         finished_at=base_time + timedelta(minutes=5),
     )
     session = _FakeSession(
-        counts=[6, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1, latest_ingest_batch],
+        counts=[6, 0, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, latest_ingest_batch],
         execute_results=[
             _FakeExecuteResult(row=(20, 30, 50)),
             _FakeExecuteResult(row=(10, 11, 21)),
@@ -456,12 +468,14 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
     assert snapshot.counts.entries == 6
     assert snapshot.counts.fetch_cooldown_entries == 1
     assert snapshot.counts.too_short_entries == 1
+    assert snapshot.counts.process_completed_entries == 1
     assert snapshot.counts.verification_not_required == 1
     assert snapshot.llm_tokens_last_24h.summary.total_tokens == 50
     assert snapshot.latest_ingest_batch is not None
     assert snapshot.latest_ingest_batch.marked_read_count == 9
     assert len(snapshot.recent_entries) == 5
     assert snapshot.recent_entries[0].content_fetch_state == "ready"
+    assert snapshot.recent_entries[0].last_process_outcome == "completed"
     assert snapshot.recent_scores[0].grade == "A"
     assert snapshot.recent_verifications[0].verdict == "verified"
     assert snapshot.recent_verification_candidates[0].grade == "A"

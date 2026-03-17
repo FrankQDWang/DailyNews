@@ -14,6 +14,10 @@ class DebugCounts(BaseModel):
     summaries: int
     scores: int
     verifications: int
+    process_completed_entries: int
+    process_quarantined_entries: int
+    process_fetch_deferred_entries: int
+    process_failed_entries: int
     verification_pending: int
     verification_failed: int
     verification_not_required: int
@@ -33,6 +37,9 @@ class DebugEntryRow(BaseModel):
     content_fetch_fail_count: int
     next_content_fetch_after: datetime | None
     last_content_fetch_error: str | None
+    last_process_outcome: str | None
+    last_process_reason: str | None
+    last_processed_at: datetime | None
     verification_state: str | None
     verification_reason: str | None
     verified_at: datetime | None

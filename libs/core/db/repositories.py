@@ -41,6 +41,13 @@ from libs.core.schemas.debug import (
 )
 from libs.core.schemas.llm import L0SummaryOutput, L1ScoreOutput, L2VerifyOutput, LLMUsage
 
+PROCESS_OUTCOME_COMPLETED = "completed"
+PROCESS_OUTCOME_QUARANTINED = "quarantined"
+PROCESS_OUTCOME_FETCH_DEFERRED = "fetch_deferred"
+PROCESS_OUTCOME_FAILED = "failed"
+PROCESS_REASON_SCORED_NO_PUSH = "scored_no_push"
+PROCESS_REASON_PUSHED = "pushed"
+
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
@@ -221,7 +228,31 @@ async def reset_content_fetch_state(session: AsyncSession, entry_id: int) -> Non
             last_content_fetch_at=None,
             next_content_fetch_after=None,
             last_content_fetch_error=None,
+            last_process_outcome=None,
+            last_process_reason=None,
+            last_processed_at=None,
             error=None,
+            updated_at=func.now(),
+        )
+    )
+    await session.commit()
+
+
+async def set_process_outcome(
+    session: AsyncSession,
+    entry_id: int,
+    outcome: str,
+    reason: str,
+    *,
+    processed_at: datetime | None = None,
+) -> None:
+    await session.execute(
+        update(Entry)
+        .where(Entry.id == entry_id)
+        .values(
+            last_process_outcome=outcome,
+            last_process_reason=reason,
+            last_processed_at=processed_at or _utc_now(),
             updated_at=func.now(),
         )
     )
@@ -230,7 +261,16 @@ async def reset_content_fetch_state(session: AsyncSession, entry_id: int) -> Non
 
 async def mark_entry_failed(session: AsyncSession, entry_id: int, error: str) -> None:
     await session.execute(
-        update(Entry).where(Entry.id == entry_id).values(status=EntryStatus.FAILED, error=error)
+        update(Entry)
+        .where(Entry.id == entry_id)
+        .values(
+            status=EntryStatus.FAILED,
+            error=error,
+            last_process_outcome=PROCESS_OUTCOME_FAILED,
+            last_process_reason=error,
+            last_processed_at=_utc_now(),
+            updated_at=func.now(),
+        )
     )
     await session.commit()
 
@@ -242,7 +282,25 @@ async def quarantine_entry(session: AsyncSession, entry_id: int, reason: str) ->
         .values(
             status=EntryStatus.QUARANTINED,
             quarantine_reason=reason,
+            last_process_outcome=PROCESS_OUTCOME_QUARANTINED,
+            last_process_reason=reason,
+            last_processed_at=_utc_now(),
             error=None,
+            updated_at=func.now(),
+        )
+    )
+    await session.commit()
+
+
+async def mark_entry_completed(session: AsyncSession, entry_id: int, reason: str) -> None:
+    await session.execute(
+        update(Entry)
+        .where(Entry.id == entry_id)
+        .values(
+            last_process_outcome=PROCESS_OUTCOME_COMPLETED,
+            last_process_reason=reason,
+            last_processed_at=_utc_now(),
+            updated_at=func.now(),
         )
     )
     await session.commit()
@@ -444,7 +502,17 @@ async def save_verification(
 
 
 async def mark_entry_pushed(session: AsyncSession, entry_id: int) -> None:
-    await session.execute(update(Entry).where(Entry.id == entry_id).values(status=EntryStatus.PUSHED))
+    await session.execute(
+        update(Entry)
+        .where(Entry.id == entry_id)
+        .values(
+            status=EntryStatus.PUSHED,
+            last_process_outcome=PROCESS_OUTCOME_COMPLETED,
+            last_process_reason=PROCESS_REASON_PUSHED,
+            last_processed_at=_utc_now(),
+            updated_at=func.now(),
+        )
+    )
     await session.commit()
 
 
@@ -634,6 +702,13 @@ async def _count_entries_with_quarantine_reason(session: AsyncSession, reason: s
     return int(count or 0)
 
 
+async def _count_entries_with_process_outcome(session: AsyncSession, outcome: str) -> int:
+    count = await session.scalar(
+        select(func.count()).select_from(Entry).where(Entry.last_process_outcome == outcome)
+    )
+    return int(count or 0)
+
+
 async def _token_usage_last_24h(
     session: AsyncSession, model: type[Summary] | type[Score] | type[Verification]
 ) -> DebugTokenUsageRow:
@@ -683,6 +758,18 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
     summary_count = await _count_rows(session, Summary)
     score_count = await _count_rows(session, Score)
     verification_count = await _count_rows(session, Verification)
+    process_completed_count = await _count_entries_with_process_outcome(
+        session, PROCESS_OUTCOME_COMPLETED
+    )
+    process_quarantined_count = await _count_entries_with_process_outcome(
+        session, PROCESS_OUTCOME_QUARANTINED
+    )
+    process_fetch_deferred_count = await _count_entries_with_process_outcome(
+        session, PROCESS_OUTCOME_FETCH_DEFERRED
+    )
+    process_failed_count = await _count_entries_with_process_outcome(
+        session, PROCESS_OUTCOME_FAILED
+    )
     verification_pending_count = await _count_entries_with_verification_state(
         session, VerificationState.PENDING
     )
@@ -734,6 +821,9 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
             content_fetch_fail_count=int(entry.content_fetch_fail_count),
             next_content_fetch_after=entry.next_content_fetch_after,
             last_content_fetch_error=entry.last_content_fetch_error,
+            last_process_outcome=entry.last_process_outcome,
+            last_process_reason=entry.last_process_reason,
+            last_processed_at=entry.last_processed_at,
             verification_state=(
                 _enum_to_value(entry.verification_state) if entry.verification_state is not None else None
             ),
@@ -829,6 +919,10 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
             summaries=summary_count,
             scores=score_count,
             verifications=verification_count,
+            process_completed_entries=process_completed_count,
+            process_quarantined_entries=process_quarantined_count,
+            process_fetch_deferred_entries=process_fetch_deferred_count,
+            process_failed_entries=process_failed_count,
             verification_pending=verification_pending_count,
             verification_failed=verification_failed_count,
             verification_not_required=verification_not_required_count,

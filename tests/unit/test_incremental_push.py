@@ -78,6 +78,10 @@ def _load_activities_module(monkeypatch: Any) -> Any:
     return importlib.import_module("libs.workflows.activities")
 
 
+async def _noop_async(*_: object, **__: object) -> None:
+    return None
+
+
 async def test_miniflux_mark_entries_read_uses_bulk_endpoint() -> None:
     seen: dict[str, Any] = {}
     env = _base_env()
@@ -547,6 +551,7 @@ async def test_should_push_activity_rejects_historical_entries(monkeypatch: Any)
     monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
     monkeypatch.setattr(activities, "get_score", fake_get_score)
     monkeypatch.setattr(activities, "set_verification_state", fake_set_verification_state)
+    monkeypatch.setattr(activities, "mark_entry_completed", _noop_async)
     monkeypatch.setattr(activities.settings, "push_window_hours", 24)
 
     result = await activities.should_push_activity(1)
@@ -628,6 +633,7 @@ async def test_should_push_activity_marks_non_a_as_not_required(monkeypatch: Any
     monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
     monkeypatch.setattr(activities, "get_score", fake_get_score)
     monkeypatch.setattr(activities, "set_verification_state", fake_set_verification_state)
+    monkeypatch.setattr(activities, "mark_entry_completed", _noop_async)
 
     result = await activities.should_push_activity(2)
 
@@ -667,6 +673,7 @@ async def test_should_push_activity_marks_daily_cap_as_not_required(monkeypatch:
     monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
     monkeypatch.setattr(activities, "get_score", fake_get_score)
     monkeypatch.setattr(activities, "set_verification_state", fake_set_verification_state)
+    monkeypatch.setattr(activities, "mark_entry_completed", _noop_async)
     monkeypatch.setattr(activities.settings, "a_push_limit_per_day", 10)
 
     result = await activities.should_push_activity(3)
@@ -726,6 +733,149 @@ async def test_summarize_entry_activity_returns_cached_summary(monkeypatch: Any)
     monkeypatch.setattr(activities, "DeepSeekClient", lambda _: _FailingDeepSeekClient())
 
     assert await activities.summarize_entry_activity(7) == {"tldr": "cached"}
+
+
+async def test_prepare_entry_content_activity_returns_ready_without_fetch(monkeypatch: Any) -> None:
+    activities = _load_activities_module(monkeypatch)
+    entry = SimpleNamespace(
+        id=7,
+        miniflux_entry_id=701,
+        content_text="long body " * 50,
+        content_fetch_state=ContentFetchState.READY,
+        next_content_fetch_after=None,
+    )
+
+    class _FailIfFetchedClient:
+        async def fetch_content(self, _: int) -> MinifluxEntry:
+            raise AssertionError("fetch_content should not be called")
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_get_entry_for_processing(_: object, __: int) -> object:
+        return entry
+
+    monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(_FakeSession()))
+    monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
+    monkeypatch.setattr(activities, "MinifluxClient", lambda _: _FailIfFetchedClient())
+
+    result = await activities.prepare_entry_content_activity(7)
+
+    assert result == {
+        "status": "ready",
+        "reason": "content_ready",
+        "marked_read": False,
+        "content_fetch_state": "ready",
+    }
+
+
+async def test_prepare_entry_content_activity_returns_deferred_for_cooldown(monkeypatch: Any) -> None:
+    activities = _load_activities_module(monkeypatch)
+    entry = SimpleNamespace(
+        id=7,
+        miniflux_entry_id=701,
+        content_text=None,
+        content_fetch_state=ContentFetchState.COOLDOWN,
+        next_content_fetch_after=datetime.now(UTC) + timedelta(minutes=15),
+    )
+    process_outcomes: list[tuple[int, str, str]] = []
+
+    class _FailIfFetchedClient:
+        async def fetch_content(self, _: int) -> MinifluxEntry:
+            raise AssertionError("fetch_content should not be called")
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_get_entry_for_processing(_: object, __: int) -> object:
+        return entry
+
+    async def fake_set_process_outcome(_: object, entry_id: int, outcome: str, reason: str) -> None:
+        process_outcomes.append((entry_id, outcome, reason))
+
+    monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(_FakeSession()))
+    monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
+    monkeypatch.setattr(activities, "set_process_outcome", fake_set_process_outcome)
+    monkeypatch.setattr(activities, "MinifluxClient", lambda _: _FailIfFetchedClient())
+
+    result = await activities.prepare_entry_content_activity(7)
+
+    assert result == {
+        "status": "fetch_deferred",
+        "reason": "cooldown",
+        "marked_read": False,
+        "content_fetch_state": "cooldown",
+    }
+    assert process_outcomes == [(7, "fetch_deferred", "cooldown")]
+
+
+async def test_prepare_entry_content_activity_blocks_retryable_fetch_failures(monkeypatch: Any) -> None:
+    activities = _load_activities_module(monkeypatch)
+    request = httpx.Request("GET", "https://example.com/v1/entries/701/fetch-content")
+    response = httpx.Response(status_code=500, request=request)
+    states = [
+        SimpleNamespace(
+            id=7,
+            miniflux_entry_id=701,
+            content_text=None,
+            content_fetch_state=ContentFetchState.READY,
+            next_content_fetch_after=None,
+        ),
+        SimpleNamespace(
+            id=7,
+            miniflux_entry_id=701,
+            content_text=None,
+            content_fetch_state=ContentFetchState.BLOCKED,
+            next_content_fetch_after=None,
+        ),
+    ]
+    process_outcomes: list[tuple[int, str, str]] = []
+    read_sync_calls: list[tuple[int, bool]] = []
+
+    class _FailingMinifluxClient:
+        async def fetch_content(self, _: int) -> MinifluxEntry:
+            raise httpx.HTTPStatusError("boom", request=request, response=response)
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_get_entry_for_processing(_: object, __: int) -> object:
+        return states.pop(0)
+
+    async def fake_record_content_fetch_failure(
+        _: object,
+        __: int,
+        *,
+        error: str,
+        at: datetime | None = None,
+    ) -> ContentFetchState:
+        del error, at
+        return ContentFetchState.BLOCKED
+
+    async def fake_set_process_outcome(_: object, entry_id: int, outcome: str, reason: str) -> None:
+        process_outcomes.append((entry_id, outcome, reason))
+
+    async def fake_sync_miniflux_read_for_entry(entry_obj: Any, *, after_quarantine: bool) -> bool:
+        read_sync_calls.append((entry_obj.id, after_quarantine))
+        return True
+
+    monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(_FakeSession()))
+    monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
+    monkeypatch.setattr(activities, "record_content_fetch_failure", fake_record_content_fetch_failure)
+    monkeypatch.setattr(activities, "set_process_outcome", fake_set_process_outcome)
+    monkeypatch.setattr(activities, "_sync_miniflux_read_for_entry", fake_sync_miniflux_read_for_entry)
+    monkeypatch.setattr(activities, "MinifluxClient", lambda _: _FailingMinifluxClient())
+
+    result = await activities.prepare_entry_content_activity(7)
+
+    assert result == {
+        "status": "fetch_deferred",
+        "reason": "blocked:http_status:500",
+        "marked_read": True,
+        "content_fetch_state": "blocked",
+    }
+    assert process_outcomes == [(7, "fetch_deferred", "blocked:http_status:500")]
+    assert read_sync_calls == [(7, False)]
 
 
 async def test_summarize_entry_activity_quarantines_too_short_content(monkeypatch: Any) -> None:
@@ -818,6 +968,7 @@ async def test_verify_entry_activity_marks_verification_failed_without_entry_fai
     monkeypatch.setattr(activities, "DeepSeekClient", lambda _: _FailingDeepSeekClient())
     monkeypatch.setattr(activities, "TavilyClient", _FakeTavilyClient)
     monkeypatch.setattr(activities, "set_verification_state", fake_set_verification_state)
+    monkeypatch.setattr(activities, "set_process_outcome", _noop_async)
 
     try:
         await activities.verify_entry_activity(7)

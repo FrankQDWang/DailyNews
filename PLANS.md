@@ -219,6 +219,33 @@ Use this file to track complex implementation plans before coding.
 - Risk: Abandoned children will continue independently, so if a later bug causes runaway process workflows, they will no longer be automatically cleaned up by parent completion.
 - Rollback: Revert the close-policy change and temporarily switch the parent workflow to await child completions directly if abandonment proves unsafe.
 
+## 2026-03-17 Process Outcome Audit and Preflight Exit Semantics
+
+### Context
+- Problem: The ingest chain was healthy again, but a subset of `ProcessEntryWorkflow` runs still ended in Temporal `FAILED` for expected business outcomes: retryable `fetch-content` failures already entering `cooldown/blocked`, and permanent low-value content already entering `quarantined`.
+- Scope: Keep the existing `scan 300 / process 30`, `quarantine`, `cooldown/blocked`, `push window`, and verification rules, but stop treating those expected exits as workflow failures.
+- Constraints: Preserve Temporal compatibility, do not change public HTTP or Telegram interfaces, and keep only real code/DB/LLM/verify/push exceptions as workflow failures.
+
+### Decisions
+- Decision 1: Add explicit process-outcome audit fields on `entries` instead of introducing another replay-sensitive enum.
+- Decision 2: Insert a dedicated content-preparation activity before `summarize/score`; if it returns `quarantined` or `fetch_deferred`, the workflow ends successfully.
+
+### Steps
+1. Add `last_process_outcome`, `last_process_reason`, and `last_processed_at` to `entries` via migration.
+2. Add `prepare_entry_content_activity(entry_id)` and short-circuit `ProcessEntryWorkflow` on `quarantined/fetch_deferred`.
+3. Update repository helpers, reprocess reset logic, and debug overview counts/fields.
+4. Add regression tests for deferred/quarantined preflight exits and run lint, mypy, pytest, and repository contract checks.
+
+### Acceptance
+- [x] Retryable `fetch-content` failures no longer have to surface as Temporal `FAILED` to be observable.
+- [x] `empty_content` and `too_short_content` exits can finish the workflow successfully after quarantine/read-sync.
+- [x] `/internal/debug/overview` exposes process-outcome counts and recent-entry process audit fields.
+- [x] `internal_reprocess` clears process-outcome audit state together with fetch-state.
+
+### Risks & Rollback
+- Risk: Any path that should still count as a real failure could accidentally be downgraded into a successful early exit if preflight classification is too broad.
+- Rollback: Revert the migration and the preflight workflow path, then rely again on raw Temporal `FAILED` status plus logs for expected exits.
+
 ## Template
 
 ### Context

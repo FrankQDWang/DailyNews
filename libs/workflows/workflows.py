@@ -13,6 +13,7 @@ with workflow.unsafe.imports_passed_through():
         build_digest_activity,
         deepdive_activity,
         mark_entry_read_activity,
+        prepare_entry_content_activity,
         prepare_ingest_batch_activity,
         refresh_miniflux_activity,
         score_entry_activity,
@@ -60,6 +61,24 @@ class IngestBatchWorkflow:
 class ProcessEntryWorkflow:
     @workflow.run
     async def run(self, entry_id: int) -> dict[str, Any]:
+        preflight = await workflow.execute_activity(
+            prepare_entry_content_activity,
+            entry_id,
+            start_to_close_timeout=timedelta(minutes=5),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+            task_queue="process",
+        )
+        if preflight["status"] != "ready":
+            return {
+                "entry_id": entry_id,
+                "preflight_status": preflight["status"],
+                "preflight_reason": preflight["reason"],
+                "marked_read": preflight["marked_read"],
+                "summary": None,
+                "score": None,
+                "push_decision_reason": None,
+                "verification": None,
+            }
         summary = await workflow.execute_activity(
             summarize_entry_activity,
             entry_id,
@@ -107,6 +126,8 @@ class ProcessEntryWorkflow:
 
         return {
             "entry_id": entry_id,
+            "preflight_status": preflight["status"],
+            "preflight_reason": preflight["reason"],
             "summary": summary,
             "score": score,
             "marked_read": marked_read,

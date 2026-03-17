@@ -32,6 +32,13 @@ class PreparedIngestBatchResult(TypedDict):
     skipped_blocked_count: int
 
 
+class PrepareEntryContentResult(TypedDict):
+    status: str
+    reason: str
+    marked_read: bool
+    content_fetch_state: str
+
+
 type PushDecisionPayloadValue = str | bool
 type PushDecisionActivityResult = dict[str, PushDecisionPayloadValue] | bool
 

@@ -22,11 +22,13 @@ from libs.core.db.enums import (
 )
 from libs.core.db.models import Entry, Score, Summary, Verification
 from libs.core.db.repositories import (
+    PROCESS_REASON_SCORED_NO_PUSH,
     create_push_event,
     get_entry_for_processing,
     get_latest_report,
     get_score,
     get_summary,
+    mark_entry_completed,
     mark_entry_failed,
     mark_entry_pushed,
     quarantine_entry,
@@ -38,6 +40,7 @@ from libs.core.db.repositories import (
     save_score,
     save_summary,
     save_verification,
+    set_process_outcome,
     set_verification_state,
     upsert_entry,
 )
@@ -60,7 +63,11 @@ from libs.integrations.miniflux_client import (
 )
 from libs.integrations.tavily_client import TavilyClient
 from libs.integrations.telegram_client import TelegramClient
-from libs.workflows.contracts import IngestEntryResult, PreparedIngestBatchResult
+from libs.workflows.contracts import (
+    IngestEntryResult,
+    PreparedIngestBatchResult,
+    PrepareEntryContentResult,
+)
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -78,6 +85,9 @@ PUSH_DECISION_REASON_NON_A = "non_a"
 PUSH_DECISION_REASON_OUTSIDE_WINDOW = "outside_push_window"
 PUSH_DECISION_REASON_DAILY_CAP = "daily_cap_reached"
 PUSH_DECISION_REASON_ELIGIBLE = "eligible_for_verification"
+PREPARE_ENTRY_STATUS_READY = "ready"
+PREPARE_ENTRY_STATUS_QUARANTINED = "quarantined"
+PREPARE_ENTRY_STATUS_FETCH_DEFERRED = "fetch_deferred"
 
 
 def _grade_is_a(score: str) -> bool:
@@ -332,6 +342,31 @@ def _build_ingest_entry_result(entry: Entry) -> IngestEntryResult:
     }
 
 
+def _build_prepare_entry_content_result(
+    *,
+    status: str,
+    reason: str,
+    marked_read: bool,
+    content_fetch_state: ContentFetchState,
+) -> PrepareEntryContentResult:
+    return {
+        "status": status,
+        "reason": reason,
+        "marked_read": marked_read,
+        "content_fetch_state": content_fetch_state.value,
+    }
+
+
+def _has_usable_entry_content(entry: Entry) -> bool:
+    return not _is_empty_content(entry.content_text) and not _is_too_short_content(entry.content_text)
+
+
+def _deferred_process_reason(fetch_state: ContentFetchState, error: str | None = None) -> str:
+    if error is None:
+        return fetch_state.value
+    return f"{fetch_state.value}:{error}"
+
+
 async def _mark_entries_read_in_batches(entry_ids: list[int], batch_size: int = 100) -> int:
     unique_entry_ids = list(dict.fromkeys(entry_ids))
     if not unique_entry_ids:
@@ -480,6 +515,156 @@ async def _sync_miniflux_read_for_entry(
         return False
     finally:
         await client.close()
+
+
+@activity.defn
+async def prepare_entry_content_activity(entry_id: int) -> PrepareEntryContentResult:
+    TASKS_TOTAL.labels(type="prepare_entry_content").inc()
+    async with SessionFactory() as session:
+        entry = await get_entry_for_processing(session, entry_id)
+        if entry is None:
+            raise RuntimeError(f"Entry not found: {entry_id}")
+
+        if entry.content_fetch_state == ContentFetchState.BLOCKED:
+            marked_read = await _sync_miniflux_read_for_entry(entry, after_quarantine=False)
+            reason = _deferred_process_reason(ContentFetchState.BLOCKED)
+            await set_process_outcome(session, entry_id, PREPARE_ENTRY_STATUS_FETCH_DEFERRED, reason)
+            logger.info("Process entry %s deferred: %s", entry_id, reason)
+            return _build_prepare_entry_content_result(
+                status=PREPARE_ENTRY_STATUS_FETCH_DEFERRED,
+                reason=reason,
+                marked_read=marked_read,
+                content_fetch_state=ContentFetchState.BLOCKED,
+            )
+
+        if (
+            entry.content_fetch_state == ContentFetchState.COOLDOWN
+            and entry.next_content_fetch_after is not None
+            and entry.next_content_fetch_after > datetime.now(UTC)
+        ):
+            reason = _deferred_process_reason(ContentFetchState.COOLDOWN)
+            await set_process_outcome(session, entry_id, PREPARE_ENTRY_STATUS_FETCH_DEFERRED, reason)
+            logger.info("Process entry %s deferred: %s", entry_id, reason)
+            return _build_prepare_entry_content_result(
+                status=PREPARE_ENTRY_STATUS_FETCH_DEFERRED,
+                reason=reason,
+                marked_read=False,
+                content_fetch_state=ContentFetchState.COOLDOWN,
+            )
+
+        if entry.content_text is not None and _is_empty_content(entry.content_text):
+            await quarantine_entry(session, entry_id, EMPTY_CONTENT_REASON)
+            entry = await get_entry_for_processing(session, entry_id)
+            if entry is None:
+                raise RuntimeError(f"Entry not found after empty-content quarantine: {entry_id}")
+            marked_read = await _sync_miniflux_read_for_entry(entry, after_quarantine=True)
+            logger.info("Process entry %s quarantined: %s", entry_id, EMPTY_CONTENT_REASON)
+            return _build_prepare_entry_content_result(
+                status=PREPARE_ENTRY_STATUS_QUARANTINED,
+                reason=EMPTY_CONTENT_REASON,
+                marked_read=marked_read,
+                content_fetch_state=entry.content_fetch_state,
+            )
+
+        if entry.content_text is not None and _is_too_short_content(entry.content_text):
+            await quarantine_entry(session, entry_id, TOO_SHORT_CONTENT_REASON)
+            entry = await get_entry_for_processing(session, entry_id)
+            if entry is None:
+                raise RuntimeError(f"Entry not found after too-short quarantine: {entry_id}")
+            marked_read = await _sync_miniflux_read_for_entry(entry, after_quarantine=True)
+            logger.info("Process entry %s quarantined: %s", entry_id, TOO_SHORT_CONTENT_REASON)
+            return _build_prepare_entry_content_result(
+                status=PREPARE_ENTRY_STATUS_QUARANTINED,
+                reason=TOO_SHORT_CONTENT_REASON,
+                marked_read=marked_read,
+                content_fetch_state=entry.content_fetch_state,
+            )
+
+        if _has_usable_entry_content(entry):
+            return _build_prepare_entry_content_result(
+                status=PREPARE_ENTRY_STATUS_READY,
+                reason="content_ready",
+                marked_read=False,
+                content_fetch_state=entry.content_fetch_state,
+            )
+
+        fetched = await _fetch_content_from_miniflux(int(entry.miniflux_entry_id))
+        if isinstance(fetched, Exception):
+            if _is_retryable_fetch_failure(fetched):
+                MINIFLUX_FETCH_CONTENT_FAILURES.inc()
+                fetch_error = _format_fetch_error(fetched)
+                next_state = await record_content_fetch_failure(
+                    session,
+                    entry_id,
+                    error=fetch_error,
+                    at=datetime.now(UTC),
+                )
+                entry = await get_entry_for_processing(session, entry_id)
+                if entry is None:
+                    raise RuntimeError(f"Entry not found after prepare fetch failure: {entry_id}")
+                marked_read = False
+                if next_state == ContentFetchState.BLOCKED:
+                    MINIFLUX_FETCH_CONTENT_BLOCKED_TOTAL.inc()
+                    marked_read = await _sync_miniflux_read_for_entry(entry, after_quarantine=False)
+                reason = _deferred_process_reason(next_state, fetch_error)
+                await set_process_outcome(
+                    session,
+                    entry_id,
+                    PREPARE_ENTRY_STATUS_FETCH_DEFERRED,
+                    reason,
+                )
+                logger.info("Process entry %s deferred: %s", entry_id, reason)
+                return _build_prepare_entry_content_result(
+                    status=PREPARE_ENTRY_STATUS_FETCH_DEFERRED,
+                    reason=reason,
+                    marked_read=marked_read,
+                    content_fetch_state=next_state,
+                )
+            raise fetched
+
+        fetched_record = _miniflux_entry_to_record(fetched)
+        await save_entry_content(
+            session,
+            entry_id,
+            content_html=fetched_record["content"],
+            content_text=fetched_record["content"],
+            fetched_at=datetime.now(UTC),
+        )
+        entry = await get_entry_for_processing(session, entry_id)
+        if entry is None:
+            raise RuntimeError(f"Entry not found after prepare fetch save: {entry_id}")
+        if _is_empty_content(entry.content_text):
+            await quarantine_entry(session, entry_id, EMPTY_CONTENT_REASON)
+            entry = await get_entry_for_processing(session, entry_id)
+            if entry is None:
+                raise RuntimeError(f"Entry not found after empty-content quarantine: {entry_id}")
+            marked_read = await _sync_miniflux_read_for_entry(entry, after_quarantine=True)
+            logger.info("Process entry %s quarantined: %s", entry_id, EMPTY_CONTENT_REASON)
+            return _build_prepare_entry_content_result(
+                status=PREPARE_ENTRY_STATUS_QUARANTINED,
+                reason=EMPTY_CONTENT_REASON,
+                marked_read=marked_read,
+                content_fetch_state=entry.content_fetch_state,
+            )
+        if _is_too_short_content(entry.content_text):
+            await quarantine_entry(session, entry_id, TOO_SHORT_CONTENT_REASON)
+            entry = await get_entry_for_processing(session, entry_id)
+            if entry is None:
+                raise RuntimeError(f"Entry not found after too-short quarantine: {entry_id}")
+            marked_read = await _sync_miniflux_read_for_entry(entry, after_quarantine=True)
+            logger.info("Process entry %s quarantined: %s", entry_id, TOO_SHORT_CONTENT_REASON)
+            return _build_prepare_entry_content_result(
+                status=PREPARE_ENTRY_STATUS_QUARANTINED,
+                reason=TOO_SHORT_CONTENT_REASON,
+                marked_read=marked_read,
+                content_fetch_state=entry.content_fetch_state,
+            )
+        return _build_prepare_entry_content_result(
+            status=PREPARE_ENTRY_STATUS_READY,
+            reason="content_fetched",
+            marked_read=False,
+            content_fetch_state=entry.content_fetch_state,
+        )
 
 
 @activity.defn
@@ -670,6 +855,7 @@ async def verify_entry_activity(entry_id: int) -> dict[str, Any]:
                 reason,
                 error=f"verify failed: {reason}",
             )
+            await set_process_outcome(session, entry_id, "failed", f"verify failed: {reason}")
             logger.warning("Verification failed for entry %s: %s", entry_id, exc)
             raise
         finally:
@@ -691,11 +877,13 @@ async def should_push_activity(entry_id: int) -> dict[str, bool | str] | bool:
                 VerificationState.NOT_REQUIRED,
                 PUSH_DECISION_REASON_NON_A,
             )
+            await mark_entry_completed(session, entry_id, PROCESS_REASON_SCORED_NO_PUSH)
             logger.info(
                 "Verification skipped for entry %s: %s",
                 entry_id,
                 PUSH_DECISION_REASON_NON_A,
             )
+            logger.info("Process entry %s completed: %s", entry_id, PROCESS_REASON_SCORED_NO_PUSH)
             return {"eligible": False, "reason": PUSH_DECISION_REASON_NON_A}
         if not _is_within_push_window(
             entry, now=datetime.now(UTC), window_hours=settings.push_window_hours
@@ -706,11 +894,13 @@ async def should_push_activity(entry_id: int) -> dict[str, bool | str] | bool:
                 VerificationState.NOT_REQUIRED,
                 PUSH_DECISION_REASON_OUTSIDE_WINDOW,
             )
+            await mark_entry_completed(session, entry_id, PROCESS_REASON_SCORED_NO_PUSH)
             logger.info(
                 "Verification skipped for entry %s: %s",
                 entry_id,
                 PUSH_DECISION_REASON_OUTSIDE_WINDOW,
             )
+            logger.info("Process entry %s completed: %s", entry_id, PROCESS_REASON_SCORED_NO_PUSH)
             return {"eligible": False, "reason": PUSH_DECISION_REASON_OUTSIDE_WINDOW}
 
         today_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -726,11 +916,13 @@ async def should_push_activity(entry_id: int) -> dict[str, bool | str] | bool:
                 VerificationState.NOT_REQUIRED,
                 PUSH_DECISION_REASON_DAILY_CAP,
             )
+            await mark_entry_completed(session, entry_id, PROCESS_REASON_SCORED_NO_PUSH)
             logger.info(
                 "Verification skipped for entry %s: %s",
                 entry_id,
                 PUSH_DECISION_REASON_DAILY_CAP,
             )
+            logger.info("Process entry %s completed: %s", entry_id, PROCESS_REASON_SCORED_NO_PUSH)
             return {"eligible": False, "reason": PUSH_DECISION_REASON_DAILY_CAP}
 
         await set_verification_state(
@@ -772,6 +964,10 @@ async def send_alert_activity(entry_id: int) -> None:
         tg = TelegramClient(settings.telegram_bot_token)
         try:
             message_ids = await tg.send_markdown(settings.telegram_target_chat_id, body)
+        except Exception as exc:  # noqa: BLE001
+            await set_process_outcome(session, entry_id, "failed", f"push failed: {exc}")
+            logger.warning("Process entry %s failed: push failed: %s", entry_id, exc)
+            raise
         finally:
             await tg.close()
 
@@ -785,6 +981,7 @@ async def send_alert_activity(entry_id: int) -> None:
             telegram_message_id=message_ids[-1] if message_ids else None,
         )
         await mark_entry_pushed(session, entry_id)
+        logger.info("Process entry %s completed: %s", entry_id, "pushed")
 
 
 def _extract_links(summary_json: dict[str, object]) -> list[dict[str, str]]:

@@ -20,6 +20,7 @@ from libs.workflows.activities import (
     fetch_and_upsert_entry_activity,
     list_unread_miniflux_activity,
     mark_entry_read_activity,
+    prepare_entry_content_activity,
     prepare_ingest_batch_activity,
     refresh_miniflux_activity,
     score_entry_activity,
@@ -60,7 +61,12 @@ async def _start_workers() -> None:
             client,
             task_queue=settings.temporal_task_queue_process,
             workflows=[ProcessEntryWorkflow],
-            activities=[summarize_entry_activity, score_entry_activity, mark_entry_read_activity],
+            activities=[
+                prepare_entry_content_activity,
+                summarize_entry_activity,
+                score_entry_activity,
+                mark_entry_read_activity,
+            ],
         ),
         Worker(
             client,

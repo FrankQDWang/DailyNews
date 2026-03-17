@@ -73,6 +73,9 @@ class Entry(Base):
     last_content_fetch_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     next_content_fetch_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_content_fetch_error: Mapped[str | None] = mapped_column(Text)
+    last_process_outcome: Mapped[str | None] = mapped_column(Text)
+    last_process_reason: Mapped[str | None] = mapped_column(Text)
+    last_processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -87,6 +90,7 @@ Index("ix_entries_status", Entry.status)
 Index("ix_entries_verification_state", Entry.verification_state)
 Index("ix_entries_content_fetch_state", Entry.content_fetch_state)
 Index("ix_entries_next_content_fetch_after", Entry.next_content_fetch_after)
+Index("ix_entries_last_process_outcome", Entry.last_process_outcome)
 Index("ix_entries_feed_published", Entry.miniflux_feed_id, Entry.published_at)
 
 

@@ -79,3 +79,35 @@ async def test_ingest_batch_workflow_abandons_process_children(monkeypatch: Any)
         "process-entry-101-abcd1234",
         "process-entry-202-abcd1234",
     ]
+
+
+async def test_process_entry_workflow_short_circuits_on_preflight_deferred(monkeypatch: Any) -> None:
+    workflow_module = _load_workflows_module(monkeypatch)
+    workflow_module_any = cast(Any, workflow_module)
+    workflow_api = workflow_module_any.workflow
+
+    async def fake_execute_activity(activity: object, *args: object, **kwargs: object) -> object:
+        del args, kwargs
+        if activity is workflow_module_any.prepare_entry_content_activity:
+            return {
+                "status": "fetch_deferred",
+                "reason": "blocked:http_status:500",
+                "marked_read": True,
+                "content_fetch_state": "blocked",
+            }
+        raise AssertionError(f"unexpected activity: {activity}")
+
+    monkeypatch.setattr(workflow_api, "execute_activity", fake_execute_activity)
+
+    result = await workflow_module.ProcessEntryWorkflow().run(42)
+
+    assert result == {
+        "entry_id": 42,
+        "preflight_status": "fetch_deferred",
+        "preflight_reason": "blocked:http_status:500",
+        "marked_read": True,
+        "summary": None,
+        "score": None,
+        "push_decision_reason": None,
+        "verification": None,
+    }
