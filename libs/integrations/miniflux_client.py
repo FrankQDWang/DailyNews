@@ -59,6 +59,8 @@ class MinifluxClient:
         )
         resp.raise_for_status()
         data = resp.json().get("entry", resp.json())
+        if "id" not in data:
+            data = {"id": entry_id, **data}
         return _parse_entry(data)
 
     async def mark_entries_read(self, entry_ids: list[int]) -> None:
