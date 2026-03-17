@@ -134,6 +134,15 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
                 "score": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11},
                 "verify": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             },
+            "latest_ingest_batch": {
+                "scanned_count": 300,
+                "actionable_count": 30,
+                "marked_read_count": 7,
+                "skipped_terminal_count": 12,
+                "skipped_cooldown_count": 4,
+                "skipped_blocked_count": 3,
+                "finished_at": "2026-03-16T10:08:00+00:00",
+            },
             "recent_entries": [
                 {
                     "id": 1,
@@ -243,6 +252,7 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
         "generated_at",
         "counts",
         "llm_tokens_last_24h",
+        "latest_ingest_batch",
         "recent_entries",
         "recent_summaries",
         "recent_scores",
@@ -255,6 +265,7 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
     assert body["counts"]["fetch_cooldown_entries"] == 1
     assert body["counts"]["verification_not_required"] == 1
     assert body["llm_tokens_last_24h"]["summary"]["total_tokens"] == 30
+    assert body["latest_ingest_batch"]["actionable_count"] == 30
     assert body["recent_entries"][0]["content_fetch_state"] == "ready"
 
 
@@ -284,11 +295,11 @@ class _FakeExecuteResult:
 
 
 class _FakeSession:
-    def __init__(self, counts: list[int], execute_results: Sequence[_FakeExecuteResult]) -> None:
+    def __init__(self, counts: Sequence[object], execute_results: Sequence[_FakeExecuteResult]) -> None:
         self._counts = iter(counts)
         self._execute_results = iter(execute_results)
 
-    async def scalar(self, _: object) -> int:
+    async def scalar(self, _: object) -> object:
         return next(self._counts)
 
     async def execute(self, _: object) -> _FakeExecuteResult:
@@ -297,7 +308,7 @@ class _FakeSession:
 
 async def test_get_debug_overview_empty_snapshot() -> None:
     session = _FakeSession(
-        counts=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        counts=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None],
         execute_results=[
             _FakeExecuteResult(row=(0, 0, 0)),
             _FakeExecuteResult(row=(0, 0, 0)),
@@ -318,6 +329,7 @@ async def test_get_debug_overview_empty_snapshot() -> None:
     assert snapshot.counts.entries == 0
     assert snapshot.counts.fetch_cooldown_entries == 0
     assert snapshot.llm_tokens_last_24h.summary.total_tokens == 0
+    assert snapshot.latest_ingest_batch is None
     assert snapshot.recent_entries == []
     assert snapshot.recent_scores == []
     assert snapshot.recent_push_events == []
@@ -413,8 +425,17 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
             created_at=base_time + timedelta(minutes=4),
         )
     ]
+    latest_ingest_batch = SimpleNamespace(
+        scanned_count=300,
+        actionable_count=30,
+        marked_read_count=9,
+        skipped_terminal_count=12,
+        skipped_cooldown_count=4,
+        skipped_blocked_count=3,
+        finished_at=base_time + timedelta(minutes=5),
+    )
     session = _FakeSession(
-        counts=[6, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1],
+        counts=[6, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1, latest_ingest_batch],
         execute_results=[
             _FakeExecuteResult(row=(20, 30, 50)),
             _FakeExecuteResult(row=(10, 11, 21)),
@@ -437,6 +458,8 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
     assert snapshot.counts.too_short_entries == 1
     assert snapshot.counts.verification_not_required == 1
     assert snapshot.llm_tokens_last_24h.summary.total_tokens == 50
+    assert snapshot.latest_ingest_batch is not None
+    assert snapshot.latest_ingest_batch.marked_read_count == 9
     assert len(snapshot.recent_entries) == 5
     assert snapshot.recent_entries[0].content_fetch_state == "ready"
     assert snapshot.recent_scores[0].grade == "A"

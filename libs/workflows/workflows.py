@@ -11,9 +11,8 @@ with workflow.unsafe.imports_passed_through():
     from libs.workflows.activities import (
         build_digest_activity,
         deepdive_activity,
-        fetch_and_upsert_entry_activity,
-        list_unread_miniflux_activity,
         mark_entry_read_activity,
+        prepare_ingest_batch_activity,
         refresh_miniflux_activity,
         score_entry_activity,
         send_alert_activity,
@@ -22,13 +21,7 @@ with workflow.unsafe.imports_passed_through():
         summarize_entry_activity,
         verify_entry_activity,
     )
-    from libs.workflows.contracts import (
-        ingest_result_entry_id,
-        ingest_result_needs_processing,
-        ingest_result_should_mark_read,
-        push_decision_is_eligible,
-        push_decision_reason,
-    )
+    from libs.workflows.contracts import push_decision_is_eligible, push_decision_reason
 
 settings = get_settings()
 
@@ -42,36 +35,16 @@ class IngestBatchWorkflow:
             start_to_close_timeout=timedelta(minutes=2),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
-        raw_entries = await workflow.execute_activity(
-            list_unread_miniflux_activity,
-            settings.miniflux_scan_limit,
+        prepared_batch = await workflow.execute_activity(
+            prepare_ingest_batch_activity,
+            args=[settings.miniflux_scan_limit, settings.ingest_actionable_limit],
             start_to_close_timeout=timedelta(minutes=3),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
 
         entry_ids: list[int] = []
-        actionable_started = 0
-        for row in raw_entries:
-            ingest_result = await workflow.execute_activity(
-                fetch_and_upsert_entry_activity,
-                row,
-                start_to_close_timeout=timedelta(minutes=5),
-                retry_policy=RetryPolicy(maximum_attempts=3),
-            )
-            entry_id = ingest_result_entry_id(ingest_result)
+        for entry_id in prepared_batch["actionable_entry_ids"]:
             entry_ids.append(entry_id)
-            if not ingest_result_needs_processing(ingest_result):
-                if ingest_result_should_mark_read(ingest_result):
-                    await workflow.execute_activity(
-                        mark_entry_read_activity,
-                        entry_id,
-                        start_to_close_timeout=timedelta(minutes=2),
-                        retry_policy=RetryPolicy(maximum_attempts=1),
-                    )
-                continue
-            if actionable_started >= settings.ingest_actionable_limit:
-                continue
-            actionable_started += 1
             await workflow.start_child_workflow(
                 ProcessEntryWorkflow.run,
                 entry_id,

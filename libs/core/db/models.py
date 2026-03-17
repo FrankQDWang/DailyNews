@@ -225,6 +225,25 @@ class DailyReport(Base):
     )
 
 
+class IngestBatchRun(Base):
+    __tablename__ = "ingest_batch_runs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    scanned_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    actionable_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    marked_read_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    skipped_terminal_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    skipped_cooldown_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    skipped_blocked_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    finished_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+Index("ix_ingest_batch_runs_finished_at", IngestBatchRun.finished_at.desc())
+
+
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
 

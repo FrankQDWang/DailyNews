@@ -22,6 +22,16 @@ class PushDecisionResult(TypedDict):
     reason: str
 
 
+class PreparedIngestBatchResult(TypedDict):
+    actionable_entry_ids: list[int]
+    marked_read_count: int
+    scanned_count: int
+    actionable_count: int
+    skipped_terminal_count: int
+    skipped_cooldown_count: int
+    skipped_blocked_count: int
+
+
 type PushDecisionPayloadValue = str | bool
 type PushDecisionActivityResult = dict[str, PushDecisionPayloadValue] | bool
 

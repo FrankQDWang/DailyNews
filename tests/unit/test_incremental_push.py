@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -105,6 +106,116 @@ async def test_miniflux_mark_entries_read_uses_bulk_endpoint() -> None:
         "path": "/v1/entries",
         "body": '{"entry_ids":[11,22],"status":"read"}',
     }
+
+
+async def test_prepare_ingest_batch_activity_returns_small_result_and_metadata_only_upserts(
+    monkeypatch: Any,
+) -> None:
+    activities = _load_activities_module(monkeypatch)
+    unread_entries = [
+        MinifluxEntry(
+            id=index,
+            feed_id=9,
+            title=f"Entry {index}",
+            url=f"https://example.com/posts/{index}",
+            author="Tester",
+            published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
+            content=f"body {index}",
+        )
+        for index in range(1, 301)
+    ]
+    upserted_content: list[tuple[str | None, str | None]] = []
+    marked_batches: list[list[int]] = []
+    saved_batch_runs: list[dict[str, Any]] = []
+
+    class _BatchClient:
+        async def list_unread_entries(self, limit: int = 100) -> list[MinifluxEntry]:
+            assert limit == 300
+            return unread_entries
+
+        async def mark_entries_read(self, entry_ids: list[int]) -> None:
+            marked_batches.append(entry_ids)
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_upsert_entry(_: object, **kwargs: object) -> int:
+        miniflux_entry_id = kwargs["miniflux_entry_id"]
+        upserted_content.append(
+            (
+                kwargs["content_html"] if isinstance(kwargs["content_html"], str) else None,
+                kwargs["content_text"] if isinstance(kwargs["content_text"], str) else None,
+            )
+        )
+        assert isinstance(miniflux_entry_id, int)
+        return miniflux_entry_id
+
+    async def fake_get_entry_for_processing(_: object, entry_id: int) -> object:
+        if entry_id <= 5:
+            return SimpleNamespace(
+                id=entry_id,
+                miniflux_entry_id=entry_id,
+                published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
+                status=EntryStatus.SCORED,
+                content_fetch_state=ContentFetchState.READY,
+                next_content_fetch_after=None,
+            )
+        if entry_id <= 7:
+            return SimpleNamespace(
+                id=entry_id,
+                miniflux_entry_id=entry_id,
+                published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
+                status=EntryStatus.FAILED,
+                content_fetch_state=ContentFetchState.BLOCKED,
+                next_content_fetch_after=None,
+            )
+        if entry_id <= 9:
+            return SimpleNamespace(
+                id=entry_id,
+                miniflux_entry_id=entry_id,
+                published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
+                status=EntryStatus.FAILED,
+                content_fetch_state=ContentFetchState.COOLDOWN,
+                next_content_fetch_after=datetime.now(UTC) + timedelta(minutes=30),
+            )
+        return SimpleNamespace(
+            id=entry_id,
+            miniflux_entry_id=entry_id,
+            published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
+            status=EntryStatus.NEW,
+            content_fetch_state=ContentFetchState.READY,
+            next_content_fetch_after=None,
+        )
+
+    async def fake_save_ingest_batch_run(_: object, **kwargs: object) -> None:
+        saved_batch_runs.append(kwargs)
+
+    monkeypatch.setattr(activities, "MinifluxClient", lambda _: _BatchClient())
+    monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(object()))
+    monkeypatch.setattr(activities, "upsert_entry", fake_upsert_entry)
+    monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
+    monkeypatch.setattr(activities, "save_ingest_batch_run", fake_save_ingest_batch_run)
+
+    result = await activities.prepare_ingest_batch_activity(300, 30)
+
+    assert result["scanned_count"] == 300
+    assert result["actionable_count"] == 30
+    assert result["actionable_entry_ids"] == list(range(10, 40))
+    assert result["marked_read_count"] == 7
+    assert result["skipped_terminal_count"] == 5
+    assert result["skipped_blocked_count"] == 2
+    assert result["skipped_cooldown_count"] == 2
+    assert marked_batches == [list(range(1, 8))]
+    assert all(content_html is None and content_text is None for content_html, content_text in upserted_content)
+    assert len(saved_batch_runs) == 1
+    assert saved_batch_runs[0]["scanned_count"] == 300
+    assert saved_batch_runs[0]["actionable_count"] == 30
+    assert saved_batch_runs[0]["marked_read_count"] == 7
+    assert saved_batch_runs[0]["skipped_terminal_count"] == 5
+    assert saved_batch_runs[0]["skipped_cooldown_count"] == 2
+    assert saved_batch_runs[0]["skipped_blocked_count"] == 2
+    assert isinstance(saved_batch_runs[0]["finished_at"], datetime)
+    assert len(json.dumps(result)) < 524288
 
 
 async def test_fetch_and_upsert_entry_activity_skips_fetch_for_terminal_status(monkeypatch: Any) -> None:

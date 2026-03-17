@@ -167,6 +167,33 @@ Use this file to track complex implementation plans before coding.
 - Risk: Metadata-only ingest plus delayed full-content fetch changes when `content_text` is refreshed, which could expose latent assumptions in older reprocess flows.
 - Rollback: Revert the migration plus activity/workflow changes and restore the old eager `fetch-content` path if production verification shows missed recent entries.
 
+## 2026-03-17 Ingest Batch Payload Closure
+
+### Context
+- Problem: `scan 300 / process 30` reduced intended fan-out, but it moved a 300-entry unread payload across the Temporal workflow boundary. Production worker logs showed `PayloadSizeWarning` at ~2.8 MB, and the ingest chain stopped after listing unread entries.
+- Scope: Keep the resource-optimization semantics, but move unread metadata processing back into an activity so the workflow only receives a small batch summary plus actionable `entry_id`s.
+- Constraints: Preserve existing public interfaces, keep `fetch_and_upsert_entry_activity` registered for legacy Temporal histories, and add durable ingest-batch observability so validation no longer depends on log inference.
+
+### Decisions
+- Decision 1: `prepare_ingest_batch_activity` owns unread metadata fetch, metadata-only upsert, terminal/cooldown/blocked classification, and batch read-sync.
+- Decision 2: `IngestBatchWorkflow` should only receive actionable `entry_id`s and never the full unread payload.
+
+### Steps
+1. Add `ingest_batch_runs` persistence plus debug schema support for `latest_ingest_batch`.
+2. Implement `prepare_ingest_batch_activity(scan_limit, actionable_limit)` and batch `mark read` chunking.
+3. Update `IngestBatchWorkflow` to orchestrate only `refresh -> prepare batch -> start child workflows`.
+4. Keep legacy `fetch_and_upsert_entry_activity` available, update tests, and validate that the new batch result remains far below Temporal payload limits.
+
+### Acceptance
+- [x] `IngestBatchWorkflow` no longer receives full unread entry payloads.
+- [x] `prepare_ingest_batch_activity` returns only batch counts and actionable `entry_id`s.
+- [x] `/internal/debug/overview` exposes `latest_ingest_batch`.
+- [x] Tests cover metadata-only upsert, small batch payload shape, and latest batch debug serialization.
+
+### Risks & Rollback
+- Risk: Batch read-sync now happens earlier in the ingest path, so a bug there could undercount `marked_read_count` even though processing still continues.
+- Rollback: Revert the new batch activity, migration, and workflow wiring, then temporarily lower `MINIFLUX_SCAN_LIMIT` while a safer payload reduction strategy is prepared.
+
 ## Template
 
 ### Context

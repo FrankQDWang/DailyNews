@@ -20,6 +20,7 @@ from libs.workflows.activities import (
     fetch_and_upsert_entry_activity,
     list_unread_miniflux_activity,
     mark_entry_read_activity,
+    prepare_ingest_batch_activity,
     refresh_miniflux_activity,
     score_entry_activity,
     send_alert_activity,
@@ -50,6 +51,7 @@ async def _start_workers() -> None:
             activities=[
                 refresh_miniflux_activity,
                 list_unread_miniflux_activity,
+                prepare_ingest_batch_activity,
                 fetch_and_upsert_entry_activity,
                 mark_entry_read_activity,
             ],

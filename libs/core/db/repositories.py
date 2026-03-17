@@ -18,6 +18,7 @@ from libs.core.db.enums import (
 from libs.core.db.models import (
     DailyReport,
     Entry,
+    IngestBatchRun,
     ProcessedTelegramUpdate,
     PushEvent,
     Score,
@@ -27,6 +28,7 @@ from libs.core.db.models import (
 from libs.core.schemas.debug import (
     DebugCounts,
     DebugEntryRow,
+    DebugLatestIngestBatch,
     DebugLlmTokensLast24h,
     DebugOverviewResponse,
     DebugProcessedUpdateRow,
@@ -117,6 +119,31 @@ async def save_entry_content(
             next_content_fetch_after=None,
             last_content_fetch_error=None,
             updated_at=func.now(),
+        )
+    )
+    await session.commit()
+
+
+async def save_ingest_batch_run(
+    session: AsyncSession,
+    *,
+    scanned_count: int,
+    actionable_count: int,
+    marked_read_count: int,
+    skipped_terminal_count: int,
+    skipped_cooldown_count: int,
+    skipped_blocked_count: int,
+    finished_at: datetime | None = None,
+) -> None:
+    session.add(
+        IngestBatchRun(
+            scanned_count=scanned_count,
+            actionable_count=actionable_count,
+            marked_read_count=marked_read_count,
+            skipped_terminal_count=skipped_terminal_count,
+            skipped_cooldown_count=skipped_cooldown_count,
+            skipped_blocked_count=skipped_blocked_count,
+            finished_at=finished_at or _utc_now(),
         )
     )
     await session.commit()
@@ -605,6 +632,21 @@ async def _token_usage_last_24h(
     )
 
 
+async def _latest_ingest_batch(session: AsyncSession) -> DebugLatestIngestBatch | None:
+    batch = await session.scalar(select(IngestBatchRun).order_by(IngestBatchRun.finished_at.desc()).limit(1))
+    if batch is None:
+        return None
+    return DebugLatestIngestBatch(
+        scanned_count=int(batch.scanned_count),
+        actionable_count=int(batch.actionable_count),
+        marked_read_count=int(batch.marked_read_count),
+        skipped_terminal_count=int(batch.skipped_terminal_count),
+        skipped_cooldown_count=int(batch.skipped_cooldown_count),
+        skipped_blocked_count=int(batch.skipped_blocked_count),
+        finished_at=batch.finished_at,
+    )
+
+
 async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
     entry_count = await _count_rows(session, Entry)
     quarantined_count = int(
@@ -637,6 +679,7 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
     summary_tokens_last_24h = await _token_usage_last_24h(session, Summary)
     score_tokens_last_24h = await _token_usage_last_24h(session, Score)
     verify_tokens_last_24h = await _token_usage_last_24h(session, Verification)
+    latest_ingest_batch = await _latest_ingest_batch(session)
 
     entries_result = await session.execute(select(Entry).order_by(Entry.created_at.desc()).limit(5))
     summaries_result = await session.execute(select(Summary).order_by(Summary.created_at.desc()).limit(5))
@@ -777,6 +820,7 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
             score=score_tokens_last_24h,
             verify=verify_tokens_last_24h,
         ),
+        latest_ingest_batch=latest_ingest_batch,
         recent_entries=recent_entries,
         recent_summaries=recent_summaries,
         recent_scores=recent_scores,

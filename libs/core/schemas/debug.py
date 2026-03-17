@@ -109,10 +109,21 @@ class DebugLlmTokensLast24h(BaseModel):
     verify: DebugTokenUsageRow
 
 
+class DebugLatestIngestBatch(BaseModel):
+    scanned_count: int
+    actionable_count: int
+    marked_read_count: int
+    skipped_terminal_count: int
+    skipped_cooldown_count: int
+    skipped_blocked_count: int
+    finished_at: datetime
+
+
 class DebugOverviewResponse(BaseModel):
     generated_at: datetime
     counts: DebugCounts
     llm_tokens_last_24h: DebugLlmTokensLast24h
+    latest_ingest_batch: DebugLatestIngestBatch | None
     recent_entries: list[DebugEntryRow]
     recent_summaries: list[DebugSummaryRow]
     recent_scores: list[DebugScoreRow]

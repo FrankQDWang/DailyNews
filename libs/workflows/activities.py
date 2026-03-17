@@ -34,6 +34,7 @@ from libs.core.db.repositories import (
     record_content_fetch_failure,
     save_daily_report,
     save_entry_content,
+    save_ingest_batch_run,
     save_score,
     save_summary,
     save_verification,
@@ -59,7 +60,7 @@ from libs.integrations.miniflux_client import (
 )
 from libs.integrations.tavily_client import TavilyClient
 from libs.integrations.telegram_client import TelegramClient
-from libs.workflows.contracts import IngestEntryResult
+from libs.workflows.contracts import IngestEntryResult, PreparedIngestBatchResult
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -106,6 +107,94 @@ async def list_unread_miniflux_activity(limit: int = 100) -> list[MinifluxEntryP
     NEW_ENTRIES_FOUND.inc(len(entries))
     logger.info("Fetched %d unread Miniflux entries", len(entries))
     return serialize_entries(entries)
+
+
+@activity.defn
+async def prepare_ingest_batch_activity(
+    scan_limit: int,
+    actionable_limit: int,
+) -> PreparedIngestBatchResult:
+    TASKS_TOTAL.labels(type="prepare_ingest_batch").inc()
+    client = MinifluxClient(settings)
+    try:
+        unread_entries = await client.list_unread_entries(limit=scan_limit)
+    finally:
+        await client.close()
+
+    NEW_ENTRIES_FOUND.inc(len(unread_entries))
+    scanned_count = len(unread_entries)
+    actionable_entry_ids: list[int] = []
+    mark_read_miniflux_entry_ids: list[int] = []
+    skipped_terminal_count = 0
+    skipped_cooldown_count = 0
+    skipped_blocked_count = 0
+
+    async with SessionFactory() as session:
+        for unread_entry in unread_entries:
+            db_entry_id = await upsert_entry(
+                session,
+                miniflux_entry_id=int(unread_entry.id),
+                miniflux_feed_id=int(unread_entry.feed_id) if unread_entry.feed_id is not None else None,
+                url=str(unread_entry.url),
+                title=str(unread_entry.title),
+                author=str(unread_entry.author) if unread_entry.author is not None else None,
+                published_at=unread_entry.published_at,
+                fetched_at=None,
+                content_html=None,
+                content_text=None,
+            )
+            db_entry = await get_entry_for_processing(session, db_entry_id)
+            if db_entry is None:
+                raise RuntimeError(f"Entry not found after metadata upsert: {db_entry_id}")
+            ingest_result = _build_ingest_entry_result(db_entry)
+            if ingest_result["needs_processing"]:
+                if len(actionable_entry_ids) < actionable_limit:
+                    actionable_entry_ids.append(int(db_entry.id))
+                continue
+            if db_entry.content_fetch_state == ContentFetchState.BLOCKED:
+                skipped_blocked_count += 1
+            elif (
+                db_entry.content_fetch_state == ContentFetchState.COOLDOWN
+                and db_entry.next_content_fetch_after is not None
+                and db_entry.next_content_fetch_after > datetime.now(UTC)
+            ):
+                skipped_cooldown_count += 1
+            else:
+                skipped_terminal_count += 1
+            if ingest_result["should_mark_read"]:
+                mark_read_miniflux_entry_ids.append(int(db_entry.miniflux_entry_id))
+
+    marked_read_count = await _mark_entries_read_in_batches(mark_read_miniflux_entry_ids)
+    async with SessionFactory() as session:
+        await save_ingest_batch_run(
+            session,
+            scanned_count=scanned_count,
+            actionable_count=len(actionable_entry_ids),
+            marked_read_count=marked_read_count,
+            skipped_terminal_count=skipped_terminal_count,
+            skipped_cooldown_count=skipped_cooldown_count,
+            skipped_blocked_count=skipped_blocked_count,
+            finished_at=datetime.now(UTC),
+        )
+
+    logger.info(
+        "Prepared ingest batch scanned=%s actionable=%s marked_read=%s skipped_terminal=%s skipped_cooldown=%s skipped_blocked=%s",
+        scanned_count,
+        len(actionable_entry_ids),
+        marked_read_count,
+        skipped_terminal_count,
+        skipped_cooldown_count,
+        skipped_blocked_count,
+    )
+    return {
+        "actionable_entry_ids": actionable_entry_ids,
+        "marked_read_count": marked_read_count,
+        "scanned_count": scanned_count,
+        "actionable_count": len(actionable_entry_ids),
+        "skipped_terminal_count": skipped_terminal_count,
+        "skipped_cooldown_count": skipped_cooldown_count,
+        "skipped_blocked_count": skipped_blocked_count,
+    }
 
 
 @activity.defn
@@ -241,6 +330,25 @@ def _build_ingest_entry_result(entry: Entry) -> IngestEntryResult:
         "needs_processing": _needs_processing(entry.status) and _fetch_content_is_actionable(entry),
         "should_mark_read": _should_mark_read_without_processing(entry),
     }
+
+
+async def _mark_entries_read_in_batches(entry_ids: list[int], batch_size: int = 100) -> int:
+    unique_entry_ids = list(dict.fromkeys(entry_ids))
+    if not unique_entry_ids:
+        return 0
+    client = MinifluxClient(settings)
+    marked_read_count = 0
+    try:
+        for start in range(0, len(unique_entry_ids), batch_size):
+            batch = unique_entry_ids[start : start + batch_size]
+            try:
+                await client.mark_entries_read(batch)
+                marked_read_count += len(batch)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to mark Miniflux entries as read in batch: %s", exc)
+    finally:
+        await client.close()
+    return marked_read_count
 
 
 async def _fetch_content_from_miniflux(entry_id: int) -> MinifluxEntry | Exception:
