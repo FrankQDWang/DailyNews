@@ -9,7 +9,14 @@ from typing import Any
 from sqlalchemy import select
 from temporalio import activity
 
-from libs.core.db.enums import EntryStatus, Grade, PushStatus, PushType, VerificationVerdict
+from libs.core.db.enums import (
+    EntryStatus,
+    Grade,
+    PushStatus,
+    PushType,
+    VerificationState,
+    VerificationVerdict,
+)
 from libs.core.db.models import Entry, Score, Summary, Verification
 from libs.core.db.repositories import (
     create_push_event,
@@ -24,6 +31,7 @@ from libs.core.db.repositories import (
     save_score,
     save_summary,
     save_verification,
+    set_verification_state,
     upsert_entry,
 )
 from libs.core.db.session import SessionFactory
@@ -47,6 +55,10 @@ PROCESSABLE_ENTRY_STATUSES = frozenset(
 )
 EMPTY_CONTENT_REASON = "empty_content"
 ZERO_WIDTH_CHARS = ("\u200b", "\u200c", "\u200d", "\ufeff")
+PUSH_DECISION_REASON_NON_A = "non_a"
+PUSH_DECISION_REASON_OUTSIDE_WINDOW = "outside_push_window"
+PUSH_DECISION_REASON_DAILY_CAP = "daily_cap_reached"
+PUSH_DECISION_REASON_ELIGIBLE = "eligible_for_verification"
 
 
 def _grade_is_a(score: str) -> bool:
@@ -323,28 +335,59 @@ async def verify_entry_activity(entry_id: int) -> dict[str, Any]:
                 fallback_evidence=fallback_evidence,
             )
             await save_verification(session, entry_id, output, settings.llm_model_verify)
+            logger.info("Verification completed for entry %s", entry_id)
             return output.model_dump()
         except Exception as exc:  # noqa: BLE001
-            await mark_entry_failed(session, entry_id, f"verify failed: {exc}")
+            reason = str(exc)
+            await set_verification_state(
+                session,
+                entry_id,
+                VerificationState.FAILED,
+                reason,
+                error=f"verify failed: {reason}",
+            )
+            logger.warning("Verification failed for entry %s: %s", entry_id, exc)
             raise
         finally:
             await client.close()
 
 
 @activity.defn
-async def should_push_activity(entry_id: int) -> bool:
+async def should_push_activity(entry_id: int) -> dict[str, bool | str] | bool:
     TASKS_TOTAL.labels(type="should_push").inc()
     async with SessionFactory() as session:
         entry = await get_entry_for_processing(session, entry_id)
         score = await get_score(session, entry_id)
         if entry is None or score is None:
-            return False
+            raise RuntimeError(f"Missing entry/score for push decision {entry_id}")
         if score.grade != Grade.A:
-            return False
+            await set_verification_state(
+                session,
+                entry_id,
+                VerificationState.NOT_REQUIRED,
+                PUSH_DECISION_REASON_NON_A,
+            )
+            logger.info(
+                "Verification skipped for entry %s: %s",
+                entry_id,
+                PUSH_DECISION_REASON_NON_A,
+            )
+            return {"eligible": False, "reason": PUSH_DECISION_REASON_NON_A}
         if not _is_within_push_window(
             entry, now=datetime.now(UTC), window_hours=settings.push_window_hours
         ):
-            return False
+            await set_verification_state(
+                session,
+                entry_id,
+                VerificationState.NOT_REQUIRED,
+                PUSH_DECISION_REASON_OUTSIDE_WINDOW,
+            )
+            logger.info(
+                "Verification skipped for entry %s: %s",
+                entry_id,
+                PUSH_DECISION_REASON_OUTSIDE_WINDOW,
+            )
+            return {"eligible": False, "reason": PUSH_DECISION_REASON_OUTSIDE_WINDOW}
 
         today_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         stmt = select(Entry.id).where(
@@ -352,7 +395,28 @@ async def should_push_activity(entry_id: int) -> bool:
             Entry.status == EntryStatus.PUSHED,
         )
         pushed_today = len((await session.execute(stmt)).all())
-        return pushed_today < settings.a_push_limit_per_day
+        if pushed_today >= settings.a_push_limit_per_day:
+            await set_verification_state(
+                session,
+                entry_id,
+                VerificationState.NOT_REQUIRED,
+                PUSH_DECISION_REASON_DAILY_CAP,
+            )
+            logger.info(
+                "Verification skipped for entry %s: %s",
+                entry_id,
+                PUSH_DECISION_REASON_DAILY_CAP,
+            )
+            return {"eligible": False, "reason": PUSH_DECISION_REASON_DAILY_CAP}
+
+        await set_verification_state(
+            session,
+            entry_id,
+            VerificationState.PENDING,
+            PUSH_DECISION_REASON_ELIGIBLE,
+        )
+        logger.info("Verification pending for entry %s", entry_id)
+        return {"eligible": True, "reason": PUSH_DECISION_REASON_ELIGIBLE}
 
 
 @activity.defn

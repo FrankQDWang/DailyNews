@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from libs.core.db.enums import EntryStatus, Grade
+from libs.core.db.enums import EntryStatus, Grade, VerificationState
 from libs.core.settings import Settings, get_settings
 from libs.integrations.miniflux_client import MinifluxClient, MinifluxEntry, MinifluxEntryPayload
 from libs.workflows.contracts import ingest_result_entry_id, ingest_result_needs_processing
@@ -243,6 +243,7 @@ async def test_should_push_activity_rejects_historical_entries(monkeypatch: Any)
     )
     score = SimpleNamespace(grade=Grade.A)
     session = _FakeSession(pushed_today=0)
+    states: list[tuple[int, VerificationState, str | None]] = []
 
     async def fake_get_entry_for_processing(_: object, __: int) -> object:
         return entry
@@ -250,14 +251,25 @@ async def test_should_push_activity_rejects_historical_entries(monkeypatch: Any)
     async def fake_get_score(_: object, __: int) -> object:
         return score
 
+    async def fake_set_verification_state(
+        _: object,
+        entry_id: int,
+        state: VerificationState,
+        reason: str | None = None,
+        **__: object,
+    ) -> None:
+        states.append((entry_id, state, reason))
+
     monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(session))
     monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
     monkeypatch.setattr(activities, "get_score", fake_get_score)
+    monkeypatch.setattr(activities, "set_verification_state", fake_set_verification_state)
     monkeypatch.setattr(activities.settings, "push_window_hours", 24)
 
     result = await activities.should_push_activity(1)
 
-    assert result is False
+    assert result == {"eligible": False, "reason": "outside_push_window"}
+    assert states == [(1, VerificationState.NOT_REQUIRED, "outside_push_window")]
 
 
 async def test_should_push_activity_uses_created_at_fallback(monkeypatch: Any) -> None:
@@ -271,6 +283,7 @@ async def test_should_push_activity_uses_created_at_fallback(monkeypatch: Any) -
     )
     score = SimpleNamespace(grade=Grade.A)
     session = _FakeSession(pushed_today=0)
+    states: list[tuple[int, VerificationState, str | None]] = []
 
     async def fake_get_entry_for_processing(_: object, __: int) -> object:
         return entry
@@ -278,15 +291,105 @@ async def test_should_push_activity_uses_created_at_fallback(monkeypatch: Any) -
     async def fake_get_score(_: object, __: int) -> object:
         return score
 
+    async def fake_set_verification_state(
+        _: object,
+        entry_id: int,
+        state: VerificationState,
+        reason: str | None = None,
+        **__: object,
+    ) -> None:
+        states.append((entry_id, state, reason))
+
     monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(session))
     monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
     monkeypatch.setattr(activities, "get_score", fake_get_score)
+    monkeypatch.setattr(activities, "set_verification_state", fake_set_verification_state)
     monkeypatch.setattr(activities.settings, "push_window_hours", 24)
     monkeypatch.setattr(activities.settings, "a_push_limit_per_day", 10)
 
     result = await activities.should_push_activity(1)
 
-    assert result is True
+    assert result == {"eligible": True, "reason": "eligible_for_verification"}
+    assert states == [(1, VerificationState.PENDING, "eligible_for_verification")]
+
+
+async def test_should_push_activity_marks_non_a_as_not_required(monkeypatch: Any) -> None:
+    activities = _load_activities_module(monkeypatch)
+    now = datetime.now(UTC)
+    entry = SimpleNamespace(
+        id=2,
+        published_at=now - timedelta(hours=1),
+        created_at=now - timedelta(hours=1),
+        status=EntryStatus.SCORED,
+    )
+    score = SimpleNamespace(grade=Grade.B)
+    session = _FakeSession(pushed_today=0)
+    states: list[tuple[int, VerificationState, str | None]] = []
+
+    async def fake_get_entry_for_processing(_: object, __: int) -> object:
+        return entry
+
+    async def fake_get_score(_: object, __: int) -> object:
+        return score
+
+    async def fake_set_verification_state(
+        _: object,
+        entry_id: int,
+        state: VerificationState,
+        reason: str | None = None,
+        **__: object,
+    ) -> None:
+        states.append((entry_id, state, reason))
+
+    monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(session))
+    monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
+    monkeypatch.setattr(activities, "get_score", fake_get_score)
+    monkeypatch.setattr(activities, "set_verification_state", fake_set_verification_state)
+
+    result = await activities.should_push_activity(2)
+
+    assert result == {"eligible": False, "reason": "non_a"}
+    assert states == [(2, VerificationState.NOT_REQUIRED, "non_a")]
+
+
+async def test_should_push_activity_marks_daily_cap_as_not_required(monkeypatch: Any) -> None:
+    activities = _load_activities_module(monkeypatch)
+    now = datetime.now(UTC)
+    entry = SimpleNamespace(
+        id=3,
+        published_at=now - timedelta(hours=1),
+        created_at=now - timedelta(hours=1),
+        status=EntryStatus.SCORED,
+    )
+    score = SimpleNamespace(grade=Grade.A)
+    session = _FakeSession(pushed_today=10)
+    states: list[tuple[int, VerificationState, str | None]] = []
+
+    async def fake_get_entry_for_processing(_: object, __: int) -> object:
+        return entry
+
+    async def fake_get_score(_: object, __: int) -> object:
+        return score
+
+    async def fake_set_verification_state(
+        _: object,
+        entry_id: int,
+        state: VerificationState,
+        reason: str | None = None,
+        **__: object,
+    ) -> None:
+        states.append((entry_id, state, reason))
+
+    monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(session))
+    monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
+    monkeypatch.setattr(activities, "get_score", fake_get_score)
+    monkeypatch.setattr(activities, "set_verification_state", fake_set_verification_state)
+    monkeypatch.setattr(activities.settings, "a_push_limit_per_day", 10)
+
+    result = await activities.should_push_activity(3)
+
+    assert result == {"eligible": False, "reason": "daily_cap_reached"}
+    assert states == [(3, VerificationState.NOT_REQUIRED, "daily_cap_reached")]
 
 
 async def test_mark_entry_read_activity_returns_false_when_miniflux_fails(monkeypatch: Any) -> None:
@@ -347,6 +450,66 @@ async def test_summarize_entry_activity_quarantines_empty_content(monkeypatch: A
 
     assert quarantined == [(7, "empty_content")]
     assert read_sync_calls == [(7, True)]
+
+
+async def test_verify_entry_activity_marks_verification_failed_without_entry_failure(
+    monkeypatch: Any,
+) -> None:
+    activities = _load_activities_module(monkeypatch)
+    entry = SimpleNamespace(id=7, title="Title", url="https://example.com", content_text="body")
+    summary = SimpleNamespace(entry_id=7, summary_json={"claims": []})
+    verification_states: list[tuple[int, VerificationState, str | None, str | None]] = []
+
+    class _FailingDeepSeekClient:
+        async def verify(self, **_: object) -> object:
+            raise RuntimeError("verify boom")
+
+        async def close(self) -> None:
+            return None
+
+    class _FakeTavilyClient:
+        def __init__(self, _: object) -> None:
+            return None
+
+        async def search(self, _: str, max_results: int = 3) -> list[dict[str, str]]:
+            return [{"title": "evidence", "url": "https://example.com/evidence"}][:max_results]
+
+        async def close(self) -> None:
+            return None
+
+    async def fake_get_entry_for_processing(_: object, __: int) -> object:
+        return entry
+
+    async def fake_scalar(_: object) -> object:
+        return summary
+
+    async def fake_set_verification_state(
+        _: object,
+        entry_id: int,
+        state: VerificationState,
+        reason: str | None = None,
+        *,
+        error: str | None = None,
+        **__: object,
+    ) -> None:
+        verification_states.append((entry_id, state, reason, error))
+
+    monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(SimpleNamespace(scalar=fake_scalar)))
+    monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
+    monkeypatch.setattr(activities, "DeepSeekClient", lambda _: _FailingDeepSeekClient())
+    monkeypatch.setattr(activities, "TavilyClient", _FakeTavilyClient)
+    monkeypatch.setattr(activities, "set_verification_state", fake_set_verification_state)
+
+    try:
+        await activities.verify_entry_activity(7)
+    except RuntimeError as exc:
+        assert "verify boom" in str(exc)
+    else:
+        raise AssertionError("expected verify_entry_activity to raise")
+
+    assert verification_states == [
+        (7, VerificationState.FAILED, "verify boom", "verify failed: verify boom")
+    ]
 
 
 def test_ingest_result_helpers_accept_legacy_int_payload() -> None:

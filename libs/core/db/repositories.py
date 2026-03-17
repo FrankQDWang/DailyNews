@@ -7,7 +7,7 @@ from sqlalchemy import Select, delete, func, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from libs.core.db.enums import EntryStatus, Grade, PushStatus, PushType
+from libs.core.db.enums import EntryStatus, Grade, PushStatus, PushType, VerificationState
 from libs.core.db.models import (
     DailyReport,
     Entry,
@@ -25,6 +25,7 @@ from libs.core.schemas.debug import (
     DebugPushEventRow,
     DebugScoreRow,
     DebugSummaryRow,
+    DebugVerificationCandidateRow,
     DebugVerificationRow,
 )
 from libs.core.schemas.llm import L0SummaryOutput, L1ScoreOutput, L2VerifyOutput
@@ -98,6 +99,28 @@ async def quarantine_entry(session: AsyncSession, entry_id: int, reason: str) ->
     await session.commit()
 
 
+async def set_verification_state(
+    session: AsyncSession,
+    entry_id: int,
+    state: VerificationState,
+    reason: str | None = None,
+    *,
+    verified_at: datetime | None = None,
+    error: str | None = None,
+) -> None:
+    await session.execute(
+        update(Entry)
+        .where(Entry.id == entry_id)
+        .values(
+            verification_state=state,
+            verification_reason=reason,
+            verified_at=verified_at,
+            error=error,
+        )
+    )
+    await session.commit()
+
+
 async def save_summary(session: AsyncSession, entry_id: int, output: L0SummaryOutput, model: str) -> None:
     stmt = pg_insert(Summary).values(
         entry_id=entry_id,
@@ -133,7 +156,14 @@ async def save_summary(session: AsyncSession, entry_id: int, output: L0SummaryOu
     await session.execute(
         update(Entry)
         .where(Entry.id == entry_id)
-        .values(status=EntryStatus.SUMMARIZED, quarantine_reason=None, error=None)
+        .values(
+            status=EntryStatus.SUMMARIZED,
+            quarantine_reason=None,
+            verification_state=None,
+            verification_reason=None,
+            verified_at=None,
+            error=None,
+        )
     )
     await session.commit()
 
@@ -177,7 +207,14 @@ async def save_score(session: AsyncSession, entry_id: int, output: L1ScoreOutput
     await session.execute(
         update(Entry)
         .where(Entry.id == entry_id)
-        .values(status=EntryStatus.SCORED, quarantine_reason=None, error=None)
+        .values(
+            status=EntryStatus.SCORED,
+            quarantine_reason=None,
+            verification_state=None,
+            verification_reason=None,
+            verified_at=None,
+            error=None,
+        )
     )
     await session.commit()
 
@@ -211,7 +248,14 @@ async def save_verification(
     await session.execute(
         update(Entry)
         .where(Entry.id == entry_id)
-        .values(status=EntryStatus.VERIFIED, quarantine_reason=None, error=None)
+        .values(
+            status=EntryStatus.VERIFIED,
+            quarantine_reason=None,
+            verification_state=VerificationState.VERIFIED,
+            verification_reason=None,
+            verified_at=func.now(),
+            error=None,
+        )
     )
     await session.commit()
 
@@ -382,6 +426,15 @@ async def _count_rows(session: AsyncSession, model: type[object]) -> int:
     return int(count or 0)
 
 
+async def _count_entries_with_verification_state(
+    session: AsyncSession, state: VerificationState
+) -> int:
+    count = await session.scalar(
+        select(func.count()).select_from(Entry).where(Entry.verification_state == state)
+    )
+    return int(count or 0)
+
+
 async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
     entry_count = await _count_rows(session, Entry)
     quarantined_count = int(
@@ -393,6 +446,18 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
     summary_count = await _count_rows(session, Summary)
     score_count = await _count_rows(session, Score)
     verification_count = await _count_rows(session, Verification)
+    verification_pending_count = await _count_entries_with_verification_state(
+        session, VerificationState.PENDING
+    )
+    verification_failed_count = await _count_entries_with_verification_state(
+        session, VerificationState.FAILED
+    )
+    verification_not_required_count = await _count_entries_with_verification_state(
+        session, VerificationState.NOT_REQUIRED
+    )
+    verification_legacy_gap_count = await _count_entries_with_verification_state(
+        session, VerificationState.LEGACY_GAP
+    )
     push_event_count = await _count_rows(session, PushEvent)
     processed_update_count = await _count_rows(session, ProcessedTelegramUpdate)
     daily_report_count = await _count_rows(session, DailyReport)
@@ -402,6 +467,13 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
     scores_result = await session.execute(select(Score).order_by(Score.created_at.desc()).limit(5))
     verifications_result = await session.execute(
         select(Verification).order_by(Verification.created_at.desc()).limit(5)
+    )
+    verification_candidates_result = await session.execute(
+        select(Entry, Score)
+        .join(Score, Score.entry_id == Entry.id)
+        .where(Score.grade == Grade.A)
+        .order_by(func.coalesce(Entry.published_at, Entry.created_at).desc())
+        .limit(5)
     )
     push_events_result = await session.execute(
         select(PushEvent).order_by(PushEvent.created_at.desc()).limit(5)
@@ -417,6 +489,11 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
             title=str(entry.title),
             status=_enum_to_value(entry.status),
             quarantine_reason=entry.quarantine_reason,
+            verification_state=(
+                _enum_to_value(entry.verification_state) if entry.verification_state is not None else None
+            ),
+            verification_reason=entry.verification_reason,
+            verified_at=entry.verified_at,
             published_at=entry.published_at,
             created_at=entry.created_at,
             updated_at=entry.updated_at,
@@ -452,6 +529,18 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
         )
         for verification in list(verifications_result.scalars().all())[:5]
     ]
+    recent_verification_candidates = [
+        DebugVerificationCandidateRow(
+            entry_id=int(entry.id),
+            grade=_enum_to_value(score.grade),
+            verification_state=(
+                _enum_to_value(entry.verification_state) if entry.verification_state is not None else None
+            ),
+            verification_reason=entry.verification_reason,
+            published_at=entry.published_at,
+        )
+        for entry, score in list(verification_candidates_result.all())[:5]
+    ]
     recent_push_events = [
         DebugPushEventRow(
             id=int(push_event.id),
@@ -483,6 +572,10 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
             summaries=summary_count,
             scores=score_count,
             verifications=verification_count,
+            verification_pending=verification_pending_count,
+            verification_failed=verification_failed_count,
+            verification_not_required=verification_not_required_count,
+            verification_legacy_gap=verification_legacy_gap_count,
             push_events=push_event_count,
             processed_telegram_updates=processed_update_count,
             daily_reports=daily_report_count,
@@ -491,6 +584,7 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
         recent_summaries=recent_summaries,
         recent_scores=recent_scores,
         recent_verifications=recent_verifications,
+        recent_verification_candidates=recent_verification_candidates,
         recent_push_events=recent_push_events,
         recent_processed_updates=recent_processed_updates,
     )

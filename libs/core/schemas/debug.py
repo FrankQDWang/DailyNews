@@ -11,6 +11,10 @@ class DebugCounts(BaseModel):
     summaries: int
     scores: int
     verifications: int
+    verification_pending: int
+    verification_failed: int
+    verification_not_required: int
+    verification_legacy_gap: int
     push_events: int
     processed_telegram_updates: int
     daily_reports: int
@@ -22,6 +26,9 @@ class DebugEntryRow(BaseModel):
     title: str
     status: str
     quarantine_reason: str | None
+    verification_state: str | None
+    verification_reason: str | None
+    verified_at: datetime | None
     published_at: datetime | None
     created_at: datetime
     updated_at: datetime
@@ -50,6 +57,14 @@ class DebugVerificationRow(BaseModel):
     created_at: datetime
 
 
+class DebugVerificationCandidateRow(BaseModel):
+    entry_id: int
+    grade: str
+    verification_state: str | None
+    verification_reason: str | None
+    published_at: datetime | None
+
+
 class DebugPushEventRow(BaseModel):
     id: int
     entry_id: int | None
@@ -73,5 +88,6 @@ class DebugOverviewResponse(BaseModel):
     recent_summaries: list[DebugSummaryRow]
     recent_scores: list[DebugScoreRow]
     recent_verifications: list[DebugVerificationRow]
+    recent_verification_candidates: list[DebugVerificationCandidateRow]
     recent_push_events: list[DebugPushEventRow]
     recent_processed_updates: list[DebugProcessedUpdateRow]

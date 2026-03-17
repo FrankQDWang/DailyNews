@@ -16,6 +16,15 @@ type IngestActivityPayloadValue = str | int | bool | None
 type IngestActivityResult = dict[str, IngestActivityPayloadValue] | int
 
 
+class PushDecisionResult(TypedDict):
+    eligible: bool
+    reason: str
+
+
+type PushDecisionPayloadValue = str | bool
+type PushDecisionActivityResult = dict[str, PushDecisionPayloadValue] | bool
+
+
 def ingest_result_entry_id(result: IngestActivityResult) -> int:
     if isinstance(result, int):
         return result
@@ -30,3 +39,15 @@ def ingest_result_needs_processing(result: IngestActivityResult) -> bool:
 
 def is_ingest_result_mapping(value: object) -> bool:
     return isinstance(value, Mapping)
+
+
+def push_decision_is_eligible(result: PushDecisionActivityResult) -> bool:
+    if isinstance(result, bool):
+        return result
+    return bool(result["eligible"])
+
+
+def push_decision_reason(result: PushDecisionActivityResult) -> str:
+    if isinstance(result, bool):
+        return "eligible_for_verification" if result else "non_a"
+    return str(result["reason"])

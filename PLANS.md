@@ -111,6 +111,33 @@ Use this file to track complex implementation plans before coding.
 - Risk: Treating empty content as permanently quarantined could hide a source that later starts returning valid content under the same entry URL.
 - Rollback: Revert the quarantine migration and activity/repository changes, then reprocess the affected unread entries manually if the quarantine policy proves too strict.
 
+## 2026-03-17 Verification and Push Audit Closure
+
+### Context
+- Problem: Production now ingests, scores, and quarantines empty-content entries correctly, but `verifications` remains at `0`. The system still cannot distinguish between “no eligible recent A-grade entries” and “verification chain is broken”.
+- Scope: Add explicit verification audit state onto `entries`, upgrade push gating from a bare boolean to a reasoned decision, backfill historical scored rows, and expose the gate result in the internal debug snapshot.
+- Constraints: Keep Telegram commands and public HTTP routes unchanged, keep realtime push dependent on successful verification, and preserve backward compatibility with older workflow histories that recorded boolean push decisions.
+
+### Decisions
+- Decision 1: Verification progress is tracked orthogonally from `entries.status` using `verification_state`, `verification_reason`, and `verified_at`.
+- Decision 2: Verification failures should no longer overwrite `entries.status` to `failed`; scored rows stay auditably scored while verification state becomes `failed`.
+
+### Steps
+1. Add verification audit fields and migration/backfill for old scored rows.
+2. Update repository save paths and a dedicated verification-state writer.
+3. Change `should_push_activity` to emit a JSON-safe decision object and log the reason.
+4. Extend debug snapshot with verification-state counts and recent A-grade candidates, then update tests.
+
+### Acceptance
+- [x] Every scored entry can now be classified as `verified`, `not_required`, `failed`, `legacy_gap`, or pending verification.
+- [x] Historical pushed-without-verification rows are labeled `legacy_gap` without triggering new side effects.
+- [x] `/internal/debug/overview` exposes verification-state counts and recent A-grade candidates.
+- [x] Verification failure no longer demotes the whole entry lifecycle to global `failed`.
+
+### Risks & Rollback
+- Risk: Historical rows can only be backfilled using the fixed 24-hour window, not the exact runtime cap state from the original moment of scoring.
+- Rollback: Revert the verification audit migration and workflow/repository changes, then rely on raw `scores`, `verifications`, and `push_events` tables for investigation again.
+
 ## Template
 
 ### Context

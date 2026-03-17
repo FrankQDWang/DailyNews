@@ -111,6 +111,10 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
                 "summaries": 1,
                 "scores": 1,
                 "verifications": 1,
+                "verification_pending": 0,
+                "verification_failed": 0,
+                "verification_not_required": 1,
+                "verification_legacy_gap": 0,
                 "push_events": 1,
                 "processed_telegram_updates": 2,
                 "daily_reports": 1,
@@ -122,6 +126,9 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
                     "title": "Entry 1",
                     "status": "scored",
                     "quarantine_reason": None,
+                    "verification_state": "not_required",
+                    "verification_reason": "non_a",
+                    "verified_at": None,
                     "published_at": "2026-03-16T10:00:00+00:00",
                     "created_at": "2026-03-16T10:01:00+00:00",
                     "updated_at": "2026-03-16T10:02:00+00:00",
@@ -151,6 +158,15 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
                     "verdict": "verified",
                     "confidence": 0.9,
                     "created_at": "2026-03-16T10:05:00+00:00",
+                }
+            ],
+            "recent_verification_candidates": [
+                {
+                    "entry_id": 1,
+                    "grade": "A",
+                    "verification_state": "not_required",
+                    "verification_reason": "non_a",
+                    "published_at": "2026-03-16T10:00:00+00:00",
                 }
             ],
             "recent_push_events": [
@@ -202,11 +218,13 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
         "recent_summaries",
         "recent_scores",
         "recent_verifications",
+        "recent_verification_candidates",
         "recent_push_events",
         "recent_processed_updates",
     }
     assert isinstance(body["generated_at"], str)
     assert body["counts"]["quarantined_entries"] == 0
+    assert body["counts"]["verification_not_required"] == 1
     assert body["counts"]["processed_telegram_updates"] == 2
     assert body["recent_entries"][0]["status"] == "scored"
 
@@ -226,6 +244,9 @@ class _FakeExecuteResult:
     def scalars(self) -> _FakeScalarResult:
         return _FakeScalarResult(self._items)
 
+    def all(self) -> Sequence[object]:
+        return self._items
+
 
 class _FakeSession:
     def __init__(self, counts: list[int], result_sets: Sequence[Sequence[object]]) -> None:
@@ -241,8 +262,8 @@ class _FakeSession:
 
 async def test_get_debug_overview_empty_snapshot() -> None:
     session = _FakeSession(
-        counts=[0, 0, 0, 0, 0, 0, 0, 0],
-        result_sets=[[], [], [], [], [], []],
+        counts=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        result_sets=[[], [], [], [], [], [], []],
     )
 
     snapshot = await get_debug_overview(session)  # type: ignore[arg-type]
@@ -264,6 +285,9 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
             title=f"Entry {index}",
             status=EntryStatus.SCORED,
             quarantine_reason=None,
+            verification_state=None,
+            verification_reason=None,
+            verified_at=None,
             published_at=base_time - timedelta(minutes=index),
             created_at=base_time - timedelta(minutes=index),
             updated_at=base_time - timedelta(minutes=index - 1),
@@ -296,6 +320,20 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
             created_at=base_time + timedelta(minutes=2),
         )
     ]
+    verification_candidates = [
+        (
+            SimpleNamespace(
+                id=1,
+                published_at=base_time - timedelta(minutes=1),
+                verification_state=None,
+                verification_reason="eligible_for_verification",
+            ),
+            SimpleNamespace(
+                entry_id=1,
+                grade=Grade.A,
+            ),
+        )
+    ]
     push_events = [
         SimpleNamespace(
             id=88,
@@ -315,12 +353,13 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
         )
     ]
     session = _FakeSession(
-        counts=[6, 0, 1, 1, 1, 1, 1, 1],
+        counts=[6, 0, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1],
         result_sets=[
             entries,
             summaries,
             scores,
             verifications,
+            verification_candidates,
             push_events,
             processed_updates,
         ],
@@ -331,10 +370,12 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
 
     assert snapshot.counts.entries == 6
     assert snapshot.counts.quarantined_entries == 0
+    assert snapshot.counts.verification_not_required == 1
     assert len(snapshot.recent_entries) == 5
     assert snapshot.recent_entries[0].status == "scored"
     assert snapshot.recent_scores[0].grade == "A"
     assert snapshot.recent_verifications[0].verdict == "verified"
+    assert snapshot.recent_verification_candidates[0].grade == "A"
     assert snapshot.recent_push_events[0].status == "sent"
     assert snapshot.recent_processed_updates[0].update_id == 9001
     assert isinstance(dumped["recent_entries"][0]["created_at"], str)

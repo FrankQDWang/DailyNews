@@ -28,6 +28,7 @@ from libs.core.db.enums import (
     Grade,
     PushStatus,
     PushType,
+    VerificationState,
     VerificationVerdict,
 )
 
@@ -57,6 +58,11 @@ class Entry(Base):
         nullable=False,
     )
     quarantine_reason: Mapped[str | None] = mapped_column(Text)
+    verification_state: Mapped[VerificationState | None] = mapped_column(
+        Enum(VerificationState, name="verification_state", values_callable=_enum_values)
+    )
+    verification_reason: Mapped[str | None] = mapped_column(Text)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -68,6 +74,7 @@ class Entry(Base):
 
 Index("ix_entries_published_at", Entry.published_at.desc())
 Index("ix_entries_status", Entry.status)
+Index("ix_entries_verification_state", Entry.verification_state)
 Index("ix_entries_feed_published", Entry.miniflux_feed_id, Entry.published_at)
 
 

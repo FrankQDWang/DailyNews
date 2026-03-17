@@ -25,6 +25,14 @@ class VerificationVerdict(str, Enum):
     UNCERTAIN = "uncertain"
 
 
+class VerificationState(str, Enum):
+    NOT_REQUIRED = "not_required"
+    PENDING = "pending"
+    VERIFIED = "verified"
+    FAILED = "failed"
+    LEGACY_GAP = "legacy_gap"
+
+
 class PushType(str, Enum):
     ALERT = "alert"
     DIGEST = "digest"

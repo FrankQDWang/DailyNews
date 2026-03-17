@@ -21,7 +21,12 @@ with workflow.unsafe.imports_passed_through():
         summarize_entry_activity,
         verify_entry_activity,
     )
-    from libs.workflows.contracts import ingest_result_entry_id, ingest_result_needs_processing
+    from libs.workflows.contracts import (
+        ingest_result_entry_id,
+        ingest_result_needs_processing,
+        push_decision_is_eligible,
+        push_decision_reason,
+    )
 
 
 @workflow.defn
@@ -92,7 +97,7 @@ class ProcessEntryWorkflow:
             retry_policy=RetryPolicy(maximum_attempts=1),
         )
 
-        should_push = await workflow.execute_activity(
+        push_decision = await workflow.execute_activity(
             should_push_activity,
             entry_id,
             start_to_close_timeout=timedelta(minutes=2),
@@ -101,7 +106,7 @@ class ProcessEntryWorkflow:
         )
 
         verification: dict[str, Any] | None = None
-        if should_push:
+        if push_decision_is_eligible(push_decision):
             verification = await workflow.execute_activity(
                 verify_entry_activity,
                 entry_id,
@@ -121,6 +126,7 @@ class ProcessEntryWorkflow:
             "summary": summary,
             "score": score,
             "marked_read": marked_read,
+            "push_decision_reason": push_decision_reason(push_decision),
             "verification": verification,
         }
 
