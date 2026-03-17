@@ -1,14 +1,40 @@
 from __future__ import annotations
 
+import importlib
+import sys
 from types import SimpleNamespace
 from typing import Any, cast
 
 from temporalio.workflow import ParentClosePolicy
 
-from libs.workflows import workflows as workflow_module
+
+def _base_env() -> dict[str, str]:
+    return {
+        "ASSISTANT_DB_URL": "postgresql+asyncpg://u:p@localhost:5432/db",
+        "TEMPORAL_HOST": "localhost:7233",
+        "DEEPSEEK_API_KEY": "x",
+        "MINIFLUX_BASE_URL": "https://example.com",
+        "MINIFLUX_API_TOKEN": "token",
+        "TELEGRAM_BOT_TOKEN": "x",
+        "TELEGRAM_WEBHOOK_SECRET": "secret",
+        "TELEGRAM_TARGET_CHAT_ID": "-10001",
+        "TELEGRAM_ADMIN_USER_IDS": "[1, 2, 3]",
+        "INTERNAL_API_TOKEN": "internal",
+    }
+
+
+def _load_workflows_module(monkeypatch: Any) -> Any:
+    for key, value in _base_env().items():
+        monkeypatch.setenv(key, value)
+
+    for module_name in ("libs.workflows.workflows", "libs.workflows.activities", "libs.core.db.session"):
+        sys.modules.pop(module_name, None)
+
+    return importlib.import_module("libs.workflows.workflows")
 
 
 async def test_ingest_batch_workflow_abandons_process_children(monkeypatch: Any) -> None:
+    workflow_module = _load_workflows_module(monkeypatch)
     workflow_module_any = cast(Any, workflow_module)
     workflow_api = workflow_module_any.workflow
     started_children: list[dict[str, Any]] = []
