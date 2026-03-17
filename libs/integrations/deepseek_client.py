@@ -109,6 +109,7 @@ class DeepSeekClient:
                 resp.raise_for_status()
                 content = resp.json()["choices"][0]["message"]["content"]
                 data = _extract_json(content)
+                data = _coerce_schema_payload(schema, data)
                 return schema.model_validate(data)
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
@@ -139,3 +140,158 @@ def _extract_json(content: str) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("Model output is not a JSON object")
     return raw
+
+
+def _coerce_schema_payload(schema: type[BaseModel], data: dict[str, Any]) -> dict[str, Any]:
+    if schema is L0SummaryOutput:
+        return _coerce_l0_summary_payload(data)
+    return data
+
+
+def _coerce_l0_summary_payload(data: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(data)
+    payload["key_points"] = _coerce_key_points(payload.get("key_points"))
+    payload["ai_pm_takeaways"] = _coerce_takeaways(payload.get("ai_pm_takeaways"))
+    payload["entities"] = _coerce_entities(payload.get("entities"))
+    payload["claims"] = _coerce_claims(payload.get("claims"))
+    payload["risk_flags"] = _coerce_risk_flags(payload.get("risk_flags"))
+    payload["tags"] = _coerce_string_list(payload.get("tags"))
+    payload["reading_time_min"] = _coerce_non_negative_int(payload.get("reading_time_min"), default=1)
+    payload["summary_confidence"] = _coerce_unit_float(
+        payload.get("summary_confidence"), default=0.5
+    )
+    payload["language"] = str(payload.get("language") or "zh")
+    payload["tldr"] = str(payload.get("tldr") or "")
+    return payload
+
+
+def _coerce_key_points(value: Any) -> list[dict[str, Any]]:
+    items = value if isinstance(value, list) else []
+    result: list[dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, dict):
+            result.append(
+                {
+                    "point": str(item.get("point") or item.get("title") or item.get("claim") or ""),
+                    "evidence": str(item.get("evidence") or item.get("why") or item.get("source") or ""),
+                    "confidence": _coerce_unit_float(item.get("confidence"), default=0.5),
+                }
+            )
+            continue
+        result.append({"point": str(item), "evidence": "", "confidence": 0.5})
+    return [row for row in result if row["point"]]
+
+
+def _coerce_takeaways(value: Any) -> list[dict[str, str]]:
+    items = value if isinstance(value, list) else []
+    result: list[dict[str, str]] = []
+    for item in items:
+        if isinstance(item, dict):
+            takeaway = str(item.get("takeaway") or item.get("point") or item.get("summary") or "")
+            result.append(
+                {
+                    "takeaway": takeaway,
+                    "why": str(item.get("why") or item.get("reason") or ""),
+                    "action": str(item.get("action") or item.get("next_step") or ""),
+                }
+            )
+            continue
+        result.append({"takeaway": str(item), "why": "", "action": ""})
+    return [row for row in result if row["takeaway"]]
+
+
+def _coerce_entities(value: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "companies": [],
+        "projects": [],
+        "papers": [],
+        "people": [],
+    }
+    if isinstance(value, dict):
+        result["companies"] = _coerce_string_list(value.get("companies"))
+        result["projects"] = _coerce_string_list(value.get("projects"))
+        result["people"] = _coerce_string_list(value.get("people"))
+        papers = value.get("papers")
+        if isinstance(papers, list):
+            result["papers"] = [
+                {
+                    "title": str(item.get("title") or item.get("name") or ""),
+                    "url": str(item.get("url") or ""),
+                }
+                for item in papers
+                if isinstance(item, dict) and (item.get("title") or item.get("name"))
+            ]
+        return result
+
+    if not isinstance(value, list):
+        return result
+
+    for item in value:
+        if isinstance(item, dict):
+            name = str(item.get("name") or item.get("title") or "")
+            kind = str(item.get("type") or "").lower()
+            if not name:
+                continue
+            if "company" in kind or "org" in kind:
+                result["companies"].append(name)
+            elif "project" in kind or "product" in kind:
+                result["projects"].append(name)
+            elif "paper" in kind:
+                result["papers"].append({"title": name, "url": str(item.get("url") or "")})
+            else:
+                result["people"].append(name)
+        else:
+            result["people"].append(str(item))
+    return result
+
+
+def _coerce_claims(value: Any) -> list[dict[str, Any]]:
+    items = value if isinstance(value, list) else []
+    result: list[dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, dict):
+            claim = str(item.get("claim") or item.get("statement") or item.get("point") or "")
+            result.append(
+                {
+                    "claim": claim,
+                    "type": str(item.get("type") or "claim"),
+                    "needs_verification": bool(item.get("needs_verification", True)),
+                }
+            )
+            continue
+        result.append({"claim": str(item), "type": "claim", "needs_verification": True})
+    return [row for row in result if row["claim"]]
+
+
+def _coerce_risk_flags(value: Any) -> list[str]:
+    items = value if isinstance(value, list) else []
+    result: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            flag = item.get("flag") or item.get("label") or item.get("name")
+            if flag:
+                result.append(str(flag))
+            continue
+        result.append(str(item))
+    return [item for item in result if item]
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item)]
+
+
+def _coerce_non_negative_int(value: Any, *, default: int) -> int:
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_unit_float(value: Any, *, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(parsed, 1.0))
