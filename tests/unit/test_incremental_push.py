@@ -11,6 +11,7 @@ import httpx
 from libs.core.db.enums import EntryStatus, Grade
 from libs.core.settings import Settings, get_settings
 from libs.integrations.miniflux_client import MinifluxClient, MinifluxEntry, MinifluxEntryPayload
+from libs.workflows.contracts import ingest_result_entry_id, ingest_result_needs_processing
 
 
 def _base_env() -> dict[str, str]:
@@ -229,3 +230,8 @@ async def test_mark_entry_read_activity_returns_false_when_miniflux_fails(monkey
     monkeypatch.setattr(activities, "MinifluxClient", lambda _: _FailingMinifluxClient())
 
     assert await activities.mark_entry_read_activity(7) is False
+
+
+def test_ingest_result_helpers_accept_legacy_int_payload() -> None:
+    assert ingest_result_entry_id(42) == 42
+    assert ingest_result_needs_processing(42) is True

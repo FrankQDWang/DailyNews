@@ -21,6 +21,7 @@ with workflow.unsafe.imports_passed_through():
         summarize_entry_activity,
         verify_entry_activity,
     )
+    from libs.workflows.contracts import ingest_result_entry_id, ingest_result_needs_processing
 
 
 @workflow.defn
@@ -47,9 +48,9 @@ class IngestBatchWorkflow:
                 start_to_close_timeout=timedelta(minutes=5),
                 retry_policy=RetryPolicy(maximum_attempts=3),
             )
-            entry_id = int(ingest_result["entry_id"])
+            entry_id = ingest_result_entry_id(ingest_result)
             entry_ids.append(entry_id)
-            if not bool(ingest_result["needs_processing"]):
+            if not ingest_result_needs_processing(ingest_result):
                 await workflow.execute_activity(
                     mark_entry_read_activity,
                     entry_id,

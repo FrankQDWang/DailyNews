@@ -35,7 +35,7 @@ from libs.integrations.miniflux_client import (
 )
 from libs.integrations.tavily_client import TavilyClient
 from libs.integrations.telegram_client import TelegramClient
-from libs.workflows.contracts import IngestEntryResult
+from libs.workflows.contracts import IngestActivityResult, IngestEntryResult
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -74,7 +74,7 @@ async def list_unread_miniflux_activity(limit: int = 100) -> list[MinifluxEntryP
 
 
 @activity.defn
-async def fetch_and_upsert_entry_activity(entry_payload: MinifluxEntryPayload) -> IngestEntryResult:
+async def fetch_and_upsert_entry_activity(entry_payload: MinifluxEntryPayload) -> IngestActivityResult:
     TASKS_TOTAL.labels(type="fetch_and_upsert_entry").inc()
     entry_id = int(entry_payload["id"])
     client = MinifluxClient(settings)
