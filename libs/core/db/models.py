@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum as PyEnum
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
@@ -31,6 +32,10 @@ from libs.core.db.enums import (
 )
 
 
+def _enum_values(enum_cls: type[PyEnum]) -> list[str]:
+    return [str(member.value) for member in enum_cls]
+
+
 class Entry(Base):
     __tablename__ = "entries"
 
@@ -47,7 +52,9 @@ class Entry(Base):
     content_hash: Mapped[str | None] = mapped_column(String(128))
     lang: Mapped[str | None] = mapped_column(String(32))
     status: Mapped[EntryStatus] = mapped_column(
-        Enum(EntryStatus, name="entry_status"), default=EntryStatus.NEW, nullable=False
+        Enum(EntryStatus, name="entry_status", values_callable=_enum_values),
+        default=EntryStatus.NEW,
+        nullable=False,
     )
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
@@ -119,7 +126,9 @@ class Score(Base):
     actionability: Mapped[float] = mapped_column(Float, nullable=False)
     credibility: Mapped[float] = mapped_column(Float, nullable=False)
     overall: Mapped[float] = mapped_column(Float, nullable=False)
-    grade: Mapped[Grade] = mapped_column(Enum(Grade, name="grade"), nullable=False)
+    grade: Mapped[Grade] = mapped_column(
+        Enum(Grade, name="grade", values_callable=_enum_values), nullable=False
+    )
     rationale: Mapped[str] = mapped_column(Text, nullable=False)
     push_recommended: Mapped[bool] = mapped_column(nullable=False)
     model: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -136,7 +145,8 @@ class Verification(Base):
         ForeignKey("entries.id", ondelete="CASCADE"), unique=True, nullable=False
     )
     verdict: Mapped[VerificationVerdict] = mapped_column(
-        Enum(VerificationVerdict, name="verification_verdict"), nullable=False
+        Enum(VerificationVerdict, name="verification_verdict", values_callable=_enum_values),
+        nullable=False,
     )
     verified_claims: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list, nullable=False)
     unverified_claims: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list, nullable=False)
@@ -157,11 +167,15 @@ class PushEvent(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     entry_id: Mapped[int | None] = mapped_column(ForeignKey("entries.id", ondelete="SET NULL"))
-    type: Mapped[PushType] = mapped_column(Enum(PushType, name="push_type"), nullable=False)
+    type: Mapped[PushType] = mapped_column(
+        Enum(PushType, name="push_type", values_callable=_enum_values), nullable=False
+    )
     telegram_chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
     payload: Mapped[dict[str, object]] = mapped_column(JSON, default=dict, nullable=False)
-    status: Mapped[PushStatus] = mapped_column(Enum(PushStatus, name="push_status"), nullable=False)
+    status: Mapped[PushStatus] = mapped_column(
+        Enum(PushStatus, name="push_status", values_callable=_enum_values), nullable=False
+    )
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -215,7 +229,9 @@ class UserFeedback(Base):
     entry_id: Mapped[int] = mapped_column(ForeignKey("entries.id", ondelete="CASCADE"), nullable=False)
     telegram_chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    feedback: Mapped[FeedbackType] = mapped_column(Enum(FeedbackType, name="feedback_type"), nullable=False)
+    feedback: Mapped[FeedbackType] = mapped_column(
+        Enum(FeedbackType, name="feedback_type", values_callable=_enum_values), nullable=False
+    )
     note: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
