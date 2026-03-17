@@ -24,6 +24,7 @@ def test_settings_admin_id_parse() -> None:
     assert settings.telegram_target_chat_id == -10001
     assert settings.assistant_db_async_url == 'postgresql+asyncpg://u:p@localhost:5432/db'
     assert settings.assistant_db_sync_url == 'postgresql://u:p@localhost:5432/db'
+    assert settings.push_window_hours == 24
 
 
 def test_settings_postgres_scheme_normalization() -> None:

@@ -19,6 +19,7 @@ from libs.workflows.activities import (
     deepdive_activity,
     fetch_and_upsert_entry_activity,
     list_unread_miniflux_activity,
+    mark_entry_read_activity,
     refresh_miniflux_activity,
     score_entry_activity,
     send_alert_activity,
@@ -46,13 +47,18 @@ async def _start_workers() -> None:
             client,
             task_queue=settings.temporal_task_queue_ingest,
             workflows=[IngestBatchWorkflow],
-            activities=[refresh_miniflux_activity, list_unread_miniflux_activity, fetch_and_upsert_entry_activity],
+            activities=[
+                refresh_miniflux_activity,
+                list_unread_miniflux_activity,
+                fetch_and_upsert_entry_activity,
+                mark_entry_read_activity,
+            ],
         ),
         Worker(
             client,
             task_queue=settings.temporal_task_queue_process,
             workflows=[ProcessEntryWorkflow],
-            activities=[summarize_entry_activity, score_entry_activity],
+            activities=[summarize_entry_activity, score_entry_activity, mark_entry_read_activity],
         ),
         Worker(
             client,

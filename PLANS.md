@@ -57,6 +57,33 @@ Use this file to track complex implementation plans before coding.
 - Risk: The snapshot query could accidentally expose oversized or sensitive fields if it returns ORM objects directly.
 - Rollback: Revert the endpoint and keep the shared auth dependency only if tests uncover unsafe response content.
 
+## 2026-03-17 Incremental Push Window and Read Sync
+
+### Context
+- Problem: Production ingest is working, but historical Miniflux `unread` backlog can still trigger Telegram pushes and repeated LLM work.
+- Scope: Restrict realtime push eligibility to the last 24 hours, mark Miniflux entries as `read` after successful scoring, and skip rerunning summary/score for entries already in terminal local states.
+- Constraints: Keep public HTTP and Telegram interfaces unchanged, avoid schema migrations, and preserve historical ingest + summary + score for future RAG.
+
+### Decisions
+- Decision 1: Realtime push stays `grade == A`, but now also requires the entry to be within `PUSH_WINDOW_HOURS` and under the daily cap.
+- Decision 2: `mark read` failures must not roll back summary/score results; future cron runs should retry read sync without rerunning LLM work.
+
+### Steps
+1. Add `PUSH_WINDOW_HOURS` config and Miniflux `mark read` integration support.
+2. Change ingest upsert activity to return a JSON-safe entry state contract instead of a bare `entry_id`.
+3. Update ingest/process workflows to skip terminal entries, run read-sync after scoring, and gate verify behind push eligibility.
+4. Add unit tests for the push window, ingest-state contract, and Miniflux read-sync behavior.
+
+### Acceptance
+- [ ] Historical backlog entries no longer create new realtime `push_events`.
+- [ ] `score` success triggers Miniflux read-sync attempts.
+- [ ] Already `scored/verified/pushed` unread entries no longer rerun summary/score.
+- [ ] Automated tests cover recent vs historical push gating and read-sync request shape.
+
+### Risks & Rollback
+- Risk: Existing recently scored-but-unpushed rows will be treated as terminal and only retried for read-sync, not retro-pushed.
+- Rollback: Revert the workflow/activity changes and restore the previous `should_push + verify-before-gate` behavior if the new gating drops valid realtime alerts.
+
 ## Template
 
 ### Context

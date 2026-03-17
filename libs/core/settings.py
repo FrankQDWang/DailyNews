@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     telegram_admin_user_ids: list[int] = Field(alias="TELEGRAM_ADMIN_USER_IDS")
 
     a_push_limit_per_day: int = Field(default=10, alias="A_PUSH_LIMIT_PER_DAY")
+    push_window_hours: int = Field(default=24, alias="PUSH_WINDOW_HOURS")
     rate_limit_user_qpm: int = Field(default=6, alias="RATE_LIMIT_USER_QPM")
     rate_limit_chat_qpm: int = Field(default=60, alias="RATE_LIMIT_CHAT_QPM")
     rate_limit_deepdive_per_day: int = Field(default=5, alias="RATE_LIMIT_DEEPDIVE_PER_DAY")

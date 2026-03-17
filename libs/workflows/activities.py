@@ -29,14 +29,19 @@ from libs.core.settings import get_settings
 from libs.integrations.deepseek_client import DeepSeekClient
 from libs.integrations.miniflux_client import (
     MinifluxClient,
+    MinifluxEntry,
     MinifluxEntryPayload,
     serialize_entries,
 )
 from libs.integrations.tavily_client import TavilyClient
 from libs.integrations.telegram_client import TelegramClient
+from libs.workflows.contracts import IngestEntryResult
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+PROCESSABLE_ENTRY_STATUSES = frozenset(
+    {EntryStatus.NEW, EntryStatus.SUMMARIZED, EntryStatus.FAILED}
+)
 
 
 def _grade_is_a(score: str) -> bool:
@@ -69,7 +74,7 @@ async def list_unread_miniflux_activity(limit: int = 100) -> list[MinifluxEntryP
 
 
 @activity.defn
-async def fetch_and_upsert_entry_activity(entry_payload: MinifluxEntryPayload) -> int:
+async def fetch_and_upsert_entry_activity(entry_payload: MinifluxEntryPayload) -> IngestEntryResult:
     TASKS_TOTAL.labels(type="fetch_and_upsert_entry").inc()
     entry_id = int(entry_payload["id"])
     client = MinifluxClient(settings)
@@ -81,7 +86,7 @@ async def fetch_and_upsert_entry_activity(entry_payload: MinifluxEntryPayload) -
     finally:
         await client.close()
 
-    src = fetched if fetched is not None else _payload_to_entry(entry_payload)
+    src = _miniflux_entry_to_record(fetched) if fetched is not None else _payload_to_entry(entry_payload)
 
     async with SessionFactory() as session:
         db_entry_id = await upsert_entry(
@@ -96,8 +101,11 @@ async def fetch_and_upsert_entry_activity(entry_payload: MinifluxEntryPayload) -
             content_html=src["content"],
             content_text=src["content"],
         )
+        db_entry = await get_entry_for_processing(session, db_entry_id)
+        if db_entry is None:
+            raise RuntimeError(f"Entry not found after upsert: {db_entry_id}")
         logger.info("Upserted Miniflux entry %s as database entry %s", src["id"], db_entry_id)
-        return db_entry_id
+        return _build_ingest_entry_result(db_entry)
 
 
 def _payload_to_entry(payload: MinifluxEntryPayload) -> dict[str, Any]:
@@ -114,6 +122,42 @@ def _payload_to_entry(payload: MinifluxEntryPayload) -> dict[str, Any]:
         "published_at": published_at,
         "content": str(payload["content"]) if payload.get("content") else "",
     }
+
+
+def _miniflux_entry_to_record(entry: MinifluxEntry) -> dict[str, Any]:
+    return {
+        "id": int(entry.id),
+        "feed_id": int(entry.feed_id) if entry.feed_id is not None else None,
+        "url": str(entry.url),
+        "title": str(entry.title),
+        "author": str(entry.author) if entry.author is not None else None,
+        "published_at": entry.published_at,
+        "content": str(entry.content) if entry.content else "",
+    }
+
+
+def _build_ingest_entry_result(entry: Entry) -> IngestEntryResult:
+    return {
+        "entry_id": int(entry.id),
+        "miniflux_entry_id": int(entry.miniflux_entry_id),
+        "published_at": entry.published_at.isoformat() if entry.published_at is not None else None,
+        "current_status": entry.status.value,
+        "needs_processing": _needs_processing(entry.status),
+    }
+
+
+def _needs_processing(status: EntryStatus) -> bool:
+    return status in PROCESSABLE_ENTRY_STATUSES
+
+
+def _entry_reference_time(entry: Entry) -> datetime:
+    return entry.published_at or entry.created_at
+
+
+def _is_within_push_window(entry: Entry, *, now: datetime, window_hours: int) -> bool:
+    reference_time = _entry_reference_time(entry)
+    threshold = now - timedelta(hours=window_hours)
+    return reference_time >= threshold
 
 
 @activity.defn
@@ -161,6 +205,35 @@ async def score_entry_activity(entry_id: int) -> dict[str, Any]:
 
 
 @activity.defn
+async def mark_entry_read_activity(entry_id: int) -> bool:
+    TASKS_TOTAL.labels(type="mark_entry_read").inc()
+    async with SessionFactory() as session:
+        entry = await get_entry_for_processing(session, entry_id)
+        if entry is None:
+            logger.warning("Skipping Miniflux read sync because entry %s does not exist", entry_id)
+            return False
+        miniflux_entry_id = int(entry.miniflux_entry_id)
+
+    client = MinifluxClient(settings)
+    try:
+        await client.mark_entries_read([miniflux_entry_id])
+        logger.info(
+            "Marked Miniflux entry %s as read for database entry %s", miniflux_entry_id, entry_id
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to mark Miniflux entry %s as read for database entry %s: %s",
+            miniflux_entry_id,
+            entry_id,
+            exc,
+        )
+        return False
+    finally:
+        await client.close()
+
+
+@activity.defn
 async def verify_entry_activity(entry_id: int) -> dict[str, Any]:
     TASKS_TOTAL.labels(type="verify_entry").inc()
     async with SessionFactory() as session:
@@ -197,10 +270,15 @@ async def verify_entry_activity(entry_id: int) -> dict[str, Any]:
 async def should_push_activity(entry_id: int) -> bool:
     TASKS_TOTAL.labels(type="should_push").inc()
     async with SessionFactory() as session:
+        entry = await get_entry_for_processing(session, entry_id)
         score = await get_score(session, entry_id)
-        if score is None:
+        if entry is None or score is None:
             return False
         if score.grade != Grade.A:
+            return False
+        if not _is_within_push_window(
+            entry, now=datetime.now(UTC), window_hours=settings.push_window_hours
+        ):
             return False
 
         today_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)

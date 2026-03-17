@@ -61,6 +61,12 @@ class MinifluxClient:
         data = resp.json().get("entry", resp.json())
         return _parse_entry(data)
 
+    async def mark_entries_read(self, entry_ids: list[int]) -> None:
+        if not entry_ids:
+            return
+        resp = await self._client.put("/v1/entries", json={"entry_ids": entry_ids, "status": "read"})
+        resp.raise_for_status()
+
 
 def serialize_entries(entries: list[MinifluxEntry]) -> list[MinifluxEntryPayload]:
     return [

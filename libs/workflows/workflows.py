@@ -12,6 +12,7 @@ with workflow.unsafe.imports_passed_through():
         deepdive_activity,
         fetch_and_upsert_entry_activity,
         list_unread_miniflux_activity,
+        mark_entry_read_activity,
         refresh_miniflux_activity,
         score_entry_activity,
         send_alert_activity,
@@ -40,13 +41,22 @@ class IngestBatchWorkflow:
 
         entry_ids: list[int] = []
         for row in raw_entries:
-            entry_id = await workflow.execute_activity(
+            ingest_result = await workflow.execute_activity(
                 fetch_and_upsert_entry_activity,
                 row,
                 start_to_close_timeout=timedelta(minutes=5),
                 retry_policy=RetryPolicy(maximum_attempts=3),
             )
+            entry_id = int(ingest_result["entry_id"])
             entry_ids.append(entry_id)
+            if not bool(ingest_result["needs_processing"]):
+                await workflow.execute_activity(
+                    mark_entry_read_activity,
+                    entry_id,
+                    start_to_close_timeout=timedelta(minutes=2),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+                continue
             await workflow.start_child_workflow(
                 ProcessEntryWorkflow.run,
                 entry_id,
@@ -74,15 +84,12 @@ class ProcessEntryWorkflow:
             retry_policy=RetryPolicy(maximum_attempts=3),
             task_queue="process",
         )
-
-        grade = str(score.get("grade", "C"))
-        if grade == "A":
-            await workflow.start_child_workflow(
-                VerifyEntryWorkflow.run,
-                entry_id,
-                id=f"verify-entry-{entry_id}-{workflow.info().run_id[:8]}",
-                task_queue="verify",
-            )
+        marked_read = await workflow.execute_activity(
+            mark_entry_read_activity,
+            entry_id,
+            start_to_close_timeout=timedelta(minutes=2),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
 
         should_push = await workflow.execute_activity(
             should_push_activity,
@@ -92,15 +99,29 @@ class ProcessEntryWorkflow:
             task_queue="push",
         )
 
+        verification: dict[str, Any] | None = None
         if should_push:
-            await workflow.start_child_workflow(
+            verification = await workflow.execute_activity(
+                verify_entry_activity,
+                entry_id,
+                start_to_close_timeout=timedelta(minutes=10),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+                task_queue="verify",
+            )
+            await workflow.execute_child_workflow(
                 PushAlertWorkflow.run,
                 entry_id,
                 id=f"push-entry-{entry_id}-{workflow.info().run_id[:8]}",
                 task_queue="push",
             )
 
-        return {"entry_id": entry_id, "summary": summary, "score": score}
+        return {
+            "entry_id": entry_id,
+            "summary": summary,
+            "score": score,
+            "marked_read": marked_read,
+            "verification": verification,
+        }
 
 
 @workflow.defn
