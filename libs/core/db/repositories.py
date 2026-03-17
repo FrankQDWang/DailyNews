@@ -59,6 +59,28 @@ async def upsert_entry(
     content_html: str | None,
     content_text: str | None,
 ) -> int:
+    existing_entry = await session.scalar(
+        select(Entry).where(Entry.miniflux_entry_id == miniflux_entry_id).limit(1)
+    )
+    if existing_entry is None:
+        existing_entry = await session.scalar(select(Entry).where(Entry.url == url).limit(1))
+    if existing_entry is not None:
+        existing_entry.miniflux_entry_id = miniflux_entry_id
+        existing_entry.miniflux_feed_id = miniflux_feed_id
+        existing_entry.url = url
+        existing_entry.title = title
+        existing_entry.author = author
+        existing_entry.published_at = published_at
+        if fetched_at is not None:
+            existing_entry.fetched_at = fetched_at
+        if content_html is not None:
+            existing_entry.content_html = content_html
+        if content_text is not None:
+            existing_entry.content_text = content_text
+        existing_entry.updated_at = _utc_now()
+        await session.commit()
+        return int(existing_entry.id)
+
     stmt = pg_insert(Entry).values(
         miniflux_entry_id=miniflux_entry_id,
         miniflux_feed_id=miniflux_feed_id,
