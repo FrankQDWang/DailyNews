@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import html
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -16,6 +18,7 @@ from libs.core.db.repositories import (
     get_score,
     mark_entry_failed,
     mark_entry_pushed,
+    quarantine_entry,
     query_for_rag,
     save_daily_report,
     save_score,
@@ -42,6 +45,8 @@ settings = get_settings()
 PROCESSABLE_ENTRY_STATUSES = frozenset(
     {EntryStatus.NEW, EntryStatus.SUMMARIZED, EntryStatus.FAILED}
 )
+EMPTY_CONTENT_REASON = "empty_content"
+ZERO_WIDTH_CHARS = ("\u200b", "\u200c", "\u200d", "\ufeff")
 
 
 def _grade_is_a(score: str) -> bool:
@@ -104,6 +109,19 @@ async def fetch_and_upsert_entry_activity(entry_payload: MinifluxEntryPayload) -
         db_entry = await get_entry_for_processing(session, db_entry_id)
         if db_entry is None:
             raise RuntimeError(f"Entry not found after upsert: {db_entry_id}")
+        if _is_empty_content(src["content"]):
+            if (
+                db_entry.status != EntryStatus.QUARANTINED
+                or db_entry.quarantine_reason != EMPTY_CONTENT_REASON
+            ):
+                await quarantine_entry(session, db_entry_id, EMPTY_CONTENT_REASON)
+                db_entry = await get_entry_for_processing(session, db_entry_id)
+                if db_entry is None:
+                    raise RuntimeError(f"Entry not found after quarantine: {db_entry_id}")
+                logger.info(
+                    "Quarantined entry %s due to %s", db_entry_id, EMPTY_CONTENT_REASON
+                )
+            return _build_ingest_entry_result(db_entry)
         logger.info("Upserted Miniflux entry %s as database entry %s", src["id"], db_entry_id)
         return _build_ingest_entry_result(db_entry)
 
@@ -160,6 +178,61 @@ def _is_within_push_window(entry: Entry, *, now: datetime, window_hours: int) ->
     return reference_time >= threshold
 
 
+def _normalize_content(raw: str | None) -> str:
+    if raw is None:
+        return ""
+    normalized = html.unescape(str(raw)).replace("\u00a0", " ")
+    for char in ZERO_WIDTH_CHARS:
+        normalized = normalized.replace(char, "")
+    normalized = re.sub(r"<[^>]+>", " ", normalized)
+    normalized = re.sub(r"\s+", "", normalized)
+    return normalized.strip()
+
+
+def _is_empty_content(raw: str | None) -> bool:
+    return _normalize_content(raw) == ""
+
+
+async def _sync_miniflux_read_for_entry(
+    entry: Entry, *, after_quarantine: bool = False
+) -> bool:
+    miniflux_entry_id = int(entry.miniflux_entry_id)
+    client = MinifluxClient(settings)
+    try:
+        await client.mark_entries_read([miniflux_entry_id])
+        if after_quarantine:
+            logger.info(
+                "Marked Miniflux entry %s as read after quarantine for database entry %s",
+                miniflux_entry_id,
+                entry.id,
+            )
+        else:
+            logger.info(
+                "Marked Miniflux entry %s as read for database entry %s",
+                miniflux_entry_id,
+                entry.id,
+            )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        if after_quarantine:
+            logger.warning(
+                "Failed to mark Miniflux entry %s as read after quarantine for database entry %s: %s",
+                miniflux_entry_id,
+                entry.id,
+                exc,
+            )
+        else:
+            logger.warning(
+                "Failed to mark Miniflux entry %s as read for database entry %s: %s",
+                miniflux_entry_id,
+                entry.id,
+                exc,
+            )
+        return False
+    finally:
+        await client.close()
+
+
 @activity.defn
 async def summarize_entry_activity(entry_id: int) -> dict[str, Any]:
     TASKS_TOTAL.labels(type="summarize_entry").inc()
@@ -167,9 +240,11 @@ async def summarize_entry_activity(entry_id: int) -> dict[str, Any]:
         entry = await get_entry_for_processing(session, entry_id)
         if not entry:
             raise RuntimeError(f"Entry not found: {entry_id}")
-        if not entry.content_text:
-            await mark_entry_failed(session, entry_id, "empty content_text")
-            raise RuntimeError(f"Entry {entry_id} has empty content")
+        if _is_empty_content(entry.content_text):
+            await quarantine_entry(session, entry_id, EMPTY_CONTENT_REASON)
+            logger.info("Quarantined entry %s due to %s", entry_id, EMPTY_CONTENT_REASON)
+            await _sync_miniflux_read_for_entry(entry, after_quarantine=True)
+            raise RuntimeError(f"Entry {entry_id} quarantined due to empty content")
 
         client = DeepSeekClient(settings)
         try:
@@ -212,25 +287,13 @@ async def mark_entry_read_activity(entry_id: int) -> bool:
         if entry is None:
             logger.warning("Skipping Miniflux read sync because entry %s does not exist", entry_id)
             return False
-        miniflux_entry_id = int(entry.miniflux_entry_id)
-
-    client = MinifluxClient(settings)
-    try:
-        await client.mark_entries_read([miniflux_entry_id])
-        logger.info(
-            "Marked Miniflux entry %s as read for database entry %s", miniflux_entry_id, entry_id
-        )
-        return True
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Failed to mark Miniflux entry %s as read for database entry %s: %s",
-            miniflux_entry_id,
-            entry_id,
-            exc,
-        )
-        return False
-    finally:
-        await client.close()
+    return await _sync_miniflux_read_for_entry(
+        entry,
+        after_quarantine=(
+            entry.status == EntryStatus.QUARANTINED
+            and entry.quarantine_reason == EMPTY_CONTENT_REASON
+        ),
+    )
 
 
 @activity.defn

@@ -153,6 +153,85 @@ async def test_fetch_and_upsert_entry_activity_returns_terminal_entry_contract(m
     }
 
 
+async def test_fetch_and_upsert_entry_activity_quarantines_empty_content(monkeypatch: Any) -> None:
+    activities = _load_activities_module(monkeypatch)
+    payload: MinifluxEntryPayload = {
+        "id": 123,
+        "feed_id": 9,
+        "title": "Entry",
+        "url": "https://example.com/post",
+        "author": "Tester",
+        "published_at": "2026-03-17T00:00:00+00:00",
+        "content": "<p></p>",
+    }
+    fetched_entry = MinifluxEntry(
+        id=123,
+        feed_id=9,
+        title="Entry",
+        url="https://example.com/post",
+        author="Tester",
+        published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
+        content="<p></p>",
+    )
+
+    class _FakeMinifluxClient:
+        async def fetch_content(self, _: int) -> MinifluxEntry:
+            return fetched_entry
+
+        async def close(self) -> None:
+            return None
+
+    entry_states = [
+        SimpleNamespace(
+            id=42,
+            miniflux_entry_id=123,
+            published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
+            status=EntryStatus.FAILED,
+            quarantine_reason=None,
+        ),
+        SimpleNamespace(
+            id=42,
+            miniflux_entry_id=123,
+            published_at=datetime(2026, 3, 17, 0, 0, tzinfo=UTC),
+            status=EntryStatus.QUARANTINED,
+            quarantine_reason="empty_content",
+        ),
+    ]
+    quarantined: list[tuple[int, str]] = []
+
+    async def fake_upsert_entry(_: object, **__: object) -> int:
+        return 42
+
+    async def fake_get_entry_for_processing(_: object, __: int) -> object:
+        return entry_states.pop(0)
+
+    async def fake_quarantine_entry(_: object, entry_id: int, reason: str) -> None:
+        quarantined.append((entry_id, reason))
+
+    monkeypatch.setattr(activities, "MinifluxClient", lambda _: _FakeMinifluxClient())
+    monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(object()))
+    monkeypatch.setattr(activities, "upsert_entry", fake_upsert_entry)
+    monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
+    monkeypatch.setattr(activities, "quarantine_entry", fake_quarantine_entry)
+
+    result = await activities.fetch_and_upsert_entry_activity(payload)
+
+    assert quarantined == [(42, "empty_content")]
+    assert result == {
+        "entry_id": 42,
+        "miniflux_entry_id": 123,
+        "published_at": "2026-03-17T00:00:00+00:00",
+        "current_status": "quarantined",
+        "needs_processing": False,
+    }
+
+
+def test_empty_content_normalization_handles_blank_html(monkeypatch: Any) -> None:
+    activities = _load_activities_module(monkeypatch)
+    assert activities._is_empty_content("<p>&nbsp;</p>\u200b")
+    assert not activities._is_empty_content("<p>Hello</p>")
+
+
 async def test_should_push_activity_rejects_historical_entries(monkeypatch: Any) -> None:
     activities = _load_activities_module(monkeypatch)
     now = datetime.now(UTC)
@@ -213,7 +292,12 @@ async def test_should_push_activity_uses_created_at_fallback(monkeypatch: Any) -
 async def test_mark_entry_read_activity_returns_false_when_miniflux_fails(monkeypatch: Any) -> None:
     activities = _load_activities_module(monkeypatch)
     session = object()
-    entry = SimpleNamespace(id=7, miniflux_entry_id=701)
+    entry = SimpleNamespace(
+        id=7,
+        miniflux_entry_id=701,
+        status=EntryStatus.SCORED,
+        quarantine_reason=None,
+    )
 
     class _FailingMinifluxClient:
         async def mark_entries_read(self, _: list[int]) -> None:
@@ -230,6 +314,39 @@ async def test_mark_entry_read_activity_returns_false_when_miniflux_fails(monkey
     monkeypatch.setattr(activities, "MinifluxClient", lambda _: _FailingMinifluxClient())
 
     assert await activities.mark_entry_read_activity(7) is False
+
+
+async def test_summarize_entry_activity_quarantines_empty_content(monkeypatch: Any) -> None:
+    activities = _load_activities_module(monkeypatch)
+    session = object()
+    entry = SimpleNamespace(id=7, miniflux_entry_id=701, content_text="<p></p>")
+    quarantined: list[tuple[int, str]] = []
+    read_sync_calls: list[tuple[int, bool]] = []
+
+    async def fake_get_entry_for_processing(_: object, __: int) -> object:
+        return entry
+
+    async def fake_quarantine_entry(_: object, entry_id: int, reason: str) -> None:
+        quarantined.append((entry_id, reason))
+
+    async def fake_sync_miniflux_read_for_entry(entry_obj: Any, *, after_quarantine: bool) -> bool:
+        read_sync_calls.append((entry_obj.id, after_quarantine))
+        return True
+
+    monkeypatch.setattr(activities, "SessionFactory", lambda: _SessionContext(session))
+    monkeypatch.setattr(activities, "get_entry_for_processing", fake_get_entry_for_processing)
+    monkeypatch.setattr(activities, "quarantine_entry", fake_quarantine_entry)
+    monkeypatch.setattr(activities, "_sync_miniflux_read_for_entry", fake_sync_miniflux_read_for_entry)
+
+    try:
+        await activities.summarize_entry_activity(7)
+    except RuntimeError as exc:
+        assert "quarantined due to empty content" in str(exc)
+    else:
+        raise AssertionError("expected summarize_entry_activity to raise for empty content")
+
+    assert quarantined == [(7, "empty_content")]
+    assert read_sync_calls == [(7, True)]
 
 
 def test_ingest_result_helpers_accept_legacy_int_payload() -> None:

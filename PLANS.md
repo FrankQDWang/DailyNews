@@ -84,6 +84,33 @@ Use this file to track complex implementation plans before coding.
 - Risk: Existing recently scored-but-unpushed rows will be treated as terminal and only retried for read-sync, not retro-pushed.
 - Rollback: Revert the workflow/activity changes and restore the previous `should_push + verify-before-gate` behavior if the new gating drops valid realtime alerts.
 
+## 2026-03-17 Empty Content Quarantine
+
+### Context
+- Problem: Some Miniflux items return effectively empty content, which causes `summary` to fail before the workflow can reach `score -> mark read`. Because `failed` and `summarized` remain processable, the same low-value backlog items keep re-entering ingest and consuming the front of the unread window.
+- Scope: Quarantine permanently empty-content entries on first detection, sync them back to Miniflux as `read`, and clean up debug visibility so stale `error` values no longer misrepresent successful rows.
+- Constraints: Preserve backward compatibility with existing Temporal histories, keep public HTTP and Telegram interfaces unchanged, and avoid introducing a generic retry subsystem for all failure types.
+
+### Decisions
+- Decision 1: Add an explicit terminal `quarantined` entry status plus `quarantine_reason`, but only use it for `empty_content` in this change.
+- Decision 2: Quarantined entries should retry only Miniflux read-sync on later ingest runs; they must not re-enter `summary`, `score`, `verify`, or `push`.
+
+### Steps
+1. Add `quarantined` state and `quarantine_reason` to the data model, debug schema, and migration layer.
+2. Detect empty content during `fetch_and_upsert_entry_activity`, quarantine immediately, and return a non-processable ingest result.
+3. Keep a fallback quarantine path in `summarize_entry_activity` for older in-flight workflows that already reached summary with empty content.
+4. Clear sticky `entries.error` on successful summary/score/verification writes, add tests, and verify the new debug counters and recent-entry shape.
+
+### Acceptance
+- [x] Empty-content entries are quarantined before they re-enter the LLM pipeline on later ingest runs.
+- [x] Quarantined entries only retry Miniflux read-sync and no longer consume summary/score capacity.
+- [x] Debug overview exposes `quarantined_entries` and per-entry `quarantine_reason`.
+- [x] Successful summary/score/verification writes clear stale `entries.error` values.
+
+### Risks & Rollback
+- Risk: Treating empty content as permanently quarantined could hide a source that later starts returning valid content under the same entry URL.
+- Rollback: Revert the quarantine migration and activity/repository changes, then reprocess the affected unread entries manually if the quarantine policy proves too strict.
+
 ## Template
 
 ### Context

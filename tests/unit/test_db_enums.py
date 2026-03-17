@@ -18,6 +18,7 @@ def test_db_enum_columns_use_database_values() -> None:
         "scored",
         "verified",
         "pushed",
+        "quarantined",
         "failed",
     ]
     assert verification_verdict.enums == [

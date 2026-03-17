@@ -9,6 +9,7 @@ class EntryStatus(str, Enum):
     SCORED = "scored"
     VERIFIED = "verified"
     PUSHED = "pushed"
+    QUARANTINED = "quarantined"
     FAILED = "failed"
 
 

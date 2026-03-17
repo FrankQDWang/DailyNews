@@ -85,6 +85,19 @@ async def mark_entry_failed(session: AsyncSession, entry_id: int, error: str) ->
     await session.commit()
 
 
+async def quarantine_entry(session: AsyncSession, entry_id: int, reason: str) -> None:
+    await session.execute(
+        update(Entry)
+        .where(Entry.id == entry_id)
+        .values(
+            status=EntryStatus.QUARANTINED,
+            quarantine_reason=reason,
+            error=None,
+        )
+    )
+    await session.commit()
+
+
 async def save_summary(session: AsyncSession, entry_id: int, output: L0SummaryOutput, model: str) -> None:
     stmt = pg_insert(Summary).values(
         entry_id=entry_id,
@@ -117,7 +130,11 @@ async def save_summary(session: AsyncSession, entry_id: int, output: L0SummaryOu
         },
     )
     await session.execute(stmt)
-    await session.execute(update(Entry).where(Entry.id == entry_id).values(status=EntryStatus.SUMMARIZED))
+    await session.execute(
+        update(Entry)
+        .where(Entry.id == entry_id)
+        .values(status=EntryStatus.SUMMARIZED, quarantine_reason=None, error=None)
+    )
     await session.commit()
 
 
@@ -157,7 +174,11 @@ async def save_score(session: AsyncSession, entry_id: int, output: L1ScoreOutput
         },
     )
     await session.execute(stmt)
-    await session.execute(update(Entry).where(Entry.id == entry_id).values(status=EntryStatus.SCORED))
+    await session.execute(
+        update(Entry)
+        .where(Entry.id == entry_id)
+        .values(status=EntryStatus.SCORED, quarantine_reason=None, error=None)
+    )
     await session.commit()
 
 
@@ -187,7 +208,11 @@ async def save_verification(
         },
     )
     await session.execute(stmt)
-    await session.execute(update(Entry).where(Entry.id == entry_id).values(status=EntryStatus.VERIFIED))
+    await session.execute(
+        update(Entry)
+        .where(Entry.id == entry_id)
+        .values(status=EntryStatus.VERIFIED, quarantine_reason=None, error=None)
+    )
     await session.commit()
 
 
@@ -359,6 +384,12 @@ async def _count_rows(session: AsyncSession, model: type[object]) -> int:
 
 async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
     entry_count = await _count_rows(session, Entry)
+    quarantined_count = int(
+        await session.scalar(
+            select(func.count()).select_from(Entry).where(Entry.status == EntryStatus.QUARANTINED)
+        )
+        or 0
+    )
     summary_count = await _count_rows(session, Summary)
     score_count = await _count_rows(session, Score)
     verification_count = await _count_rows(session, Verification)
@@ -385,6 +416,7 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
             miniflux_entry_id=int(entry.miniflux_entry_id),
             title=str(entry.title),
             status=_enum_to_value(entry.status),
+            quarantine_reason=entry.quarantine_reason,
             published_at=entry.published_at,
             created_at=entry.created_at,
             updated_at=entry.updated_at,
@@ -447,6 +479,7 @@ async def get_debug_overview(session: AsyncSession) -> DebugOverviewResponse:
         generated_at=_utc_now(),
         counts=DebugCounts(
             entries=entry_count,
+            quarantined_entries=quarantined_count,
             summaries=summary_count,
             scores=score_count,
             verifications=verification_count,

@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 class DebugCounts(BaseModel):
     entries: int
+    quarantined_entries: int
     summaries: int
     scores: int
     verifications: int
@@ -20,6 +21,7 @@ class DebugEntryRow(BaseModel):
     miniflux_entry_id: int
     title: str
     status: str
+    quarantine_reason: str | None
     published_at: datetime | None
     created_at: datetime
     updated_at: datetime

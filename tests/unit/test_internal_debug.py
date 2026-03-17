@@ -107,6 +107,7 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
             "generated_at": "2026-03-16T12:00:00+00:00",
             "counts": {
                 "entries": 1,
+                "quarantined_entries": 0,
                 "summaries": 1,
                 "scores": 1,
                 "verifications": 1,
@@ -120,6 +121,7 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
                     "miniflux_entry_id": 101,
                     "title": "Entry 1",
                     "status": "scored",
+                    "quarantine_reason": None,
                     "published_at": "2026-03-16T10:00:00+00:00",
                     "created_at": "2026-03-16T10:01:00+00:00",
                     "updated_at": "2026-03-16T10:02:00+00:00",
@@ -204,6 +206,7 @@ def test_internal_debug_overview_returns_fixed_shape(monkeypatch: Any) -> None:
         "recent_processed_updates",
     }
     assert isinstance(body["generated_at"], str)
+    assert body["counts"]["quarantined_entries"] == 0
     assert body["counts"]["processed_telegram_updates"] == 2
     assert body["recent_entries"][0]["status"] == "scored"
 
@@ -238,7 +241,7 @@ class _FakeSession:
 
 async def test_get_debug_overview_empty_snapshot() -> None:
     session = _FakeSession(
-        counts=[0, 0, 0, 0, 0, 0, 0],
+        counts=[0, 0, 0, 0, 0, 0, 0, 0],
         result_sets=[[], [], [], [], [], []],
     )
 
@@ -260,6 +263,7 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
             miniflux_entry_id=1000 + index,
             title=f"Entry {index}",
             status=EntryStatus.SCORED,
+            quarantine_reason=None,
             published_at=base_time - timedelta(minutes=index),
             created_at=base_time - timedelta(minutes=index),
             updated_at=base_time - timedelta(minutes=index - 1),
@@ -311,7 +315,7 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
         )
     ]
     session = _FakeSession(
-        counts=[6, 1, 1, 1, 1, 1, 1],
+        counts=[6, 0, 1, 1, 1, 1, 1, 1],
         result_sets=[
             entries,
             summaries,
@@ -326,6 +330,7 @@ async def test_get_debug_overview_maps_rows_and_limits_recent_entries() -> None:
     dumped = snapshot.model_dump(mode="json")
 
     assert snapshot.counts.entries == 6
+    assert snapshot.counts.quarantined_entries == 0
     assert len(snapshot.recent_entries) == 5
     assert snapshot.recent_entries[0].status == "scored"
     assert snapshot.recent_scores[0].grade == "A"

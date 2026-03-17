@@ -56,6 +56,7 @@ class Entry(Base):
         default=EntryStatus.NEW,
         nullable=False,
     )
+    quarantine_reason: Mapped[str | None] = mapped_column(Text)
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
